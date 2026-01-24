@@ -1,0 +1,3 @@
+[Desktop Entry]
+Type=Application
+Exec=gnome-terminal -- bash -c "python3 ~/Rosmaster/rosmaster/rosmaster_main.py;exec bash"
