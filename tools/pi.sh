@@ -10,6 +10,7 @@
 #                          so give it 50 cm of clear floor all round. Saved in pi_reports/calibrate.txt
 #   tools/pi.sh depth-setup  build Orbbec's depth-camera SDK on the robot and test it (10+ minutes,
 #                          needs internet on the robot). Log in pi_reports/depth_setup.txt
+#   tools/pi.sh backup   copy the robot's own files (Yahboom app, motor library, device rules) to pi_backup/
 #   tools/pi.sh health   check the robot's SD card for corrupted system files (several minutes)
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
@@ -46,6 +47,17 @@ run)
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
+    ;;
+backup)
+    # Copy the robot-specific files to the Mac (read-only on the robot). Not a full disk image.
+    B="$REPO/pi_backup"; mkdir -p "$B"
+    ssh "$PI" 'cd / && tar czf - --ignore-failed-read --warning=no-file-changed \
+        home/pi/Rosmaster etc/udev/rules.d boot/firmware/config.txt boot/firmware/cmdline.txt \
+        usr/local/lib/python3.11/dist-packages \
+        $(cd / && ls -d home/pi/*.sh home/pi/*.py home/pi/Version.txt home/pi/.bashrc home/pi/.config/autostart 2>/dev/null) 2>/tmp/backup_errors.txt; \
+        echo "--- tar errors:" >&2; cat /tmp/backup_errors.txt >&2' > "$B/robot-files.tgz"
+    ssh "$PI" 'pip list 2>/dev/null; echo ---; dpkg --get-selections 2>&1 | head -3000; echo ---; ls -la ~ ; du -sh ~/* 2>/dev/null' > "$B/inventory.txt"
+    ls -lh "$B"; echo "Files in archive: $(tar tzf "$B/robot-files.tgz" | wc -l)"
     ;;
 health)
     # Looks for a failing SD card / power problems: corrupted system files, disk and voltage errors.
@@ -101,6 +113,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
