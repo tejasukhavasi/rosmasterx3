@@ -14,6 +14,8 @@
 #   tools/pi.sh repair   step 1 of the SD-card repair: report the damage, schedule a disk check, reboot
 #   tools/pi.sh repair2  step 2, after the reboot: fix the package database and the compiler
 #   tools/pi.sh health   check the robot's SD card for corrupted system files (several minutes)
+#   tools/pi.sh record [secs]  record colour + depth + lidar for a few seconds (pi_reports/rec-<time>/)
+#   tools/pi.sh probe    list the AI frameworks and model files on the robot (pi_reports/probe.txt)
 #   tools/pi.sh depth-snap   save a colour picture and a depth picture taken together (pi_reports/depth_snap/)
 #   tools/pi.sh depth-test   run just the depth test (seconds). Summary in pi_reports/depth_test.txt
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
@@ -80,6 +82,30 @@ dpkg -s debsums >/dev/null 2>&1 || sudo apt-get install -y -qq debsums
 sudo debsums -s 2>&1 | head -200; echo "== done"' 2>&1 | tee "$OUT/health.txt"
     echo "Saved pi_reports/health.txt"
     ;;
+record)
+    # tools/pi.sh record [seconds] [frames per second]
+    deploy || exit 1
+    scp -q "$REPO/tools/record.py" "$PI:/tmp/" || exit 1
+    ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
+    ssh "$PI" "cd $REMOTE_DIR && python3 -u /tmp/record.py ${2:-12} ${3:-6} 2>&1" | grep --line-buffered "^##\|Traceback\|Error" | cut -c1-200
+    R="$OUT/rec-$(date +%H%M%S)"; mkdir -p "$R"
+    ssh "$PI" 'tar czf - -C /tmp/rec .' | tar xzf - -C "$R" && echo "Saved $(ls "$R" | wc -l | tr -d ' ') files to ${R#$REPO/}"
+    ;;
+probe)
+    ssh "$PI" 'python3 - <<PY
+import importlib
+for m in ("torch","torchvision","tensorflow","tflite_runtime","onnxruntime","mediapipe","ultralytics","ncnn","openvino","scipy","sklearn","filterpy","PIL"):
+    try:
+        mod = importlib.import_module(m); print("have", m, getattr(mod, "__version__", "?"))
+    except Exception as e:
+        print("no  ", m, "-", str(e).splitlines()[0][:70])
+import cv2
+print("cv2", cv2.__version__, "dnn" , hasattr(cv2, "dnn"), "trackers:", [n for n in dir(cv2) if n.startswith("Tracker")], "legacy:", hasattr(cv2, "legacy"))
+PY
+echo "== model files"; find ~ /usr/share /opt -maxdepth 6 \( -name "*.pt" -o -name "*.onnx" -o -name "*.tflite" -o -name "*.caffemodel" -o -name "*.weights" -o -name "*.param" -o -name "*.pb" -o -name "*.h5" \) -size +100k 2>/dev/null | xargs -r ls -la 2>/dev/null | awk "{print \$5, \$NF}" | head -60
+echo "== cpu / memory"; nproc; free -m | head -2; df -h / | tail -1' 2>&1 | tee "$OUT/probe.txt"
+    echo "Saved pi_reports/probe.txt"
+    ;;
 depth-snap)
     scp -q "$REPO/tools/depth_snap.py" "$PI:/tmp/" || exit 1
     ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
@@ -137,6 +163,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
