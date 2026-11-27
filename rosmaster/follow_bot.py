@@ -22,7 +22,9 @@ the motors keep their last command if the program cannot say "stop".
 """
 import argparse
 import atexit
+import logging
 import math
+import os
 import signal
 import threading
 import time
@@ -359,6 +361,9 @@ class FollowBot(object):
         self.cam = camera
         self.drive = drive
         self.lidar = lidar
+        self.frames_dir = None          # set to a folder to save a picture each time a toy is spotted
+        self._frame_n = 0
+        self._frame_t = 0.0
         self.search = search
         self.lock = threading.Lock()
         self.running = True
@@ -484,6 +489,7 @@ class FollowBot(object):
                 if not was_visible:
                     self.drive.beep()
                     print("[follow_bot] saw toy at x=%d y=%d, %d px wide" % det, flush=True)
+                    self._save_frame(frame, det, now)
             elif self.search:
                 vx, vz, status, note = rec.cmd(now)
                 vz = clamp(vz, -max_turn, max_turn)
@@ -525,6 +531,21 @@ class FollowBot(object):
             if ok:
                 with self.lock:
                     self.jpeg = jpg.tobytes()
+
+    def _save_frame(self, frame, det, now, keep=40):
+        """Debug aid: keep pictures of the last `keep` things taken for the toy."""
+        if not self.frames_dir or now - self._frame_t < 0.7:
+            return
+        self._frame_t = now
+        pic = frame.copy()
+        cv.circle(pic, (int(det[0]), int(det[1])), int(det[2] / 2) + 4, (255, 255, 255), 2)
+        name = "spot-%02d.jpg" % (self._frame_n % keep)
+        self._frame_n += 1
+        try:
+            cv.imwrite(os.path.join(self.frames_dir, name), pic, [cv.IMWRITE_JPEG_QUALITY, 80])
+            print("[follow_bot]   saved %s" % name, flush=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _draw(frame, det, status, following):
@@ -697,6 +718,8 @@ def main():
                     help="use the lidar to avoid obstacles; DEG is the lidar angle that points "
                          "straight ahead of the robot (see lidar.py)")
     ap.add_argument("--lidar-port", default="/dev/rplidar")
+    ap.add_argument("--save-frames", default=None, metavar="DIR",
+                    help="save a picture to DIR each time something is taken for the toy (last 40 kept)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -715,6 +738,12 @@ def main():
             print("[follow_bot] lidar NOT available (%s); it will refuse to reverse" % e, flush=True)
             lidar = Lidar(args.lidar_port, front_deg=args.lidar_front)     # never started: reports no data
     fb = FollowBot(cam, drive, target_size=args.target_size, search=not args.no_search, lidar=lidar)
+
+    if args.save_frames:
+        os.makedirs(args.save_frames, exist_ok=True)
+        fb.frames_dir = args.save_frames
+    if not args.debug:
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)    # no line per web request
 
     def shutdown(*_):
         fb.running = False

@@ -6,6 +6,8 @@
 #   tools/pi.sh snap     save a camera frame from the running follow bot to pi_reports/
 #   tools/pi.sh diag     collect hardware info from the robot into pi_reports/diag.txt
 #   tools/pi.sh lidar    identify the lidar on /dev/rplidar into pi_reports/lidar.txt
+#   tools/pi.sh calibrate  find the lidar's forward direction: the robot drives 12 cm forward and back,
+#                          so give it 50 cm of clear floor all round. Saved in pi_reports/calibrate.txt
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
 # Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
@@ -42,6 +44,13 @@ snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
     ;;
+calibrate)
+    deploy || exit 1
+    scp -q "$REPO/tools/lidar_calibrate.py" "$PI:/tmp/" || exit 1
+    ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
+    ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; python3 -u /tmp/lidar_calibrate.py" 2>&1 | tee "$OUT/calibrate.txt"
+    echo "Saved pi_reports/calibrate.txt"
+    ;;
 scan)
     deploy || exit 1
     ssh "$PI" "cd $REMOTE_DIR && python3 -u lidar.py" 2>&1 | tee "$OUT/scan.txt"
@@ -73,6 +82,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
