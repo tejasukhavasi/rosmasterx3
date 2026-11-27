@@ -70,13 +70,28 @@ if [ "$1" = "2" ]; then
     else
         echo "Damaged records:"; echo "$BAD"
         PKGS=$(for f in $BAD; do basename "$f" .list; done | tr '\n' ' ')
-        echo "Change: move these files to /var/backups/dpkg-bad-lists/ and reinstall: $PKGS"
-        echo "(reinstalling a package writes a fresh record)"
+        echo "Change: keep the originals in /var/backups/dpkg-bad-lists/, strip the garbage out of each"
+        echo "record so the package system runs again, then reinstall each package to write a fresh"
+        echo "record. The kernel package is cleaned but not reinstalled (too risky on this card)."
         if ask "Do it?"; then
-            sudo mkdir -p /var/backups/dpkg-bad-lists && sudo mv $BAD /var/backups/dpkg-bad-lists/
+            sudo mkdir -p /var/backups/dpkg-bad-lists
+            for f in $BAD; do
+                sudo cp -n "$f" /var/backups/dpkg-bad-lists/
+                LC_ALL=C grep -a '^/' "$f" | LC_ALL=C grep -av '[^[:print:]]' > /tmp/clean.list
+                sudo cp /tmp/clean.list "$f"
+                echo "cleaned $(basename "$f"): kept $(wc -l < /tmp/clean.list) lines"
+            done
             sudo dpkg --configure -a 2>&1 | tail -5
             sudo apt-get update -qq
-            sudo apt-get install -y --reinstall $PKGS 2>&1 | tail -6
+            for p in $PKGS; do
+                case "$p" in linux-image*) echo "skipped reinstall of $p"; continue;; esac
+                if sudo apt-get install -y --reinstall "$p" >/tmp/reinstall.log 2>&1; then
+                    echo "reinstalled $p"
+                else
+                    echo "COULD NOT reinstall $p: $(grep -E '^E:|dpkg: error' /tmp/reinstall.log | head -2)"
+                fi
+            done
+            echo "records still damaged: $(bad_lists | wc -l)"
         else
             echo "Skipped; package installs will keep failing."; exit 1
         fi
