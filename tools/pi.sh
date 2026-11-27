@@ -31,7 +31,7 @@ OUT="$REPO/pi_reports"
 mkdir -p "$OUT"
 
 deploy() {
-    scp -q "$REPO/rosmaster/follow_bot.py" "$REPO/rosmaster/lidar.py" "$REPO/rosmaster/orbbec_camera.py" "$PI:$REMOTE_DIR/" && echo "Copied follow_bot.py, lidar.py and orbbec_camera.py to $PI"
+    scp -q "$REPO/rosmaster/follow_bot.py" "$REPO/rosmaster/lidar.py" "$REPO/rosmaster/orbbec_camera.py" "$REPO/rosmaster/detector.py" "$PI:$REMOTE_DIR/" && echo "Copied the follow bot files to $PI"
 }
 
 case "$1" in

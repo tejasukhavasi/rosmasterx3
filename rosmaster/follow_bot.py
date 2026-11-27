@@ -93,6 +93,18 @@ SCAN_TURN = 1.5         # rad/s (about 85 degrees a second), whatever the speed 
 SCAN_SWEEP_S = 5.0      # one sweep = a bit more than a full circle
 SCAN_REST_S = 1.0       # short rest; the next sweep goes the other way
 SCAN_GIVE_UP_S = 30.0   # then wait quietly until the toy shows up again
+# Following by shape (depth camera): the target is whatever blob of similar
+# distance sits where the target was a moment ago.
+FOLLOW_DIST = 1.2       # m to keep from a person/thing followed by shape
+DIST_GAIN = 0.6         # m/s per metre of distance error
+DIST_DEADBAND = 0.15    # m
+DEPTH_SLAB_MM = 350     # the target's blob = pixels within this of its last distance
+DEPTH_GROW = 0.35       # look this much beyond the last box (each side) for the blob
+DEPTH_MIN_AREA = 150    # blob pixels at half resolution
+DEPTH_MAX_WIDTH_M = 1.6 # a "blob" wider than this is a wall, not a target
+FOCAL_PX = 600.0        # camera focal length in pixels at 640 wide (measured from the ball: ~630)
+MOTION_MM = 300         # something this much nearer than a moment ago counts as "walked in"
+MOTION_MIN_AREA = 500   # half-resolution pixels
 LEARN_BOX = 0.12        # centre box (fraction of frame height) for "Learn colour"
 
 
@@ -147,16 +159,18 @@ def detect(frame, ranges, prev=None):
     return best, mask
 
 
-def learn_color(frame):
-    """Sample the centre box and build an HSV range around its colour.
+def learn_color(frame, at=None):
+    """Sample a small box (the centre, or around the point `at`) and build an HSV
+    range around its colour.
 
     Returns (ranges, message). ranges is None if the sample is too grey/dark.
     Only the colourful pixels in the box are used, so white highlights on a
     shiny ball and a bit of background around a small one don't spoil it.
     """
     h, w = frame.shape[:2]
-    r = int(h * LEARN_BOX / 2)
-    roi = cv.GaussianBlur(frame, (5, 5), 0)[h // 2 - r:h // 2 + r, w // 2 - r:w // 2 + r]
+    r = int(h * LEARN_BOX / 2) if at is None else 12
+    cx, cy = (w // 2, h // 2) if at is None else (int(clamp(at[0], r, w - r)), int(clamp(at[1], r, h - r)))
+    roi = cv.GaussianBlur(frame, (5, 5), 0)[cy - r:cy + r, cx - r:cx + r]
     hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
     vivid = hsv[(hsv[:, 1] > 60) & (hsv[:, 2] > 50)]
     if len(vivid) < 0.3 * len(hsv):
@@ -211,6 +225,146 @@ def compute_cmd(det, frame_w, frame_h, target_size, max_fwd, max_turn):
     return vx, vz
 
 
+class DepthTarget(object):
+    """Follows one thing through the depth picture.
+
+    The target is the blob of pixels at about the same distance as last time,
+    close to where it was last time. Works for anything the depth camera can
+    see (people, pets, boxes, big toys), needs no training, and gives the
+    distance directly. Internally works at half resolution; everything it
+    hands out is in full-resolution pixels and metres.
+    """
+
+    def __init__(self):
+        self.locked = False
+        self.z = 0.0            # mm
+        self.box = None         # half-res (x1, y1, x2, y2)
+        self.cx = self.cy = 0.0
+        self.area = 0
+        self.label = "thing"
+
+    def start_at(self, depth, x, y, label="thing"):
+        """Lock onto whatever is at pixel (x, y). False if depth has no reading there."""
+        d = depth[::2, ::2]
+        h, w = d.shape
+        x, y = int(clamp(x / 2, 0, w - 1)), int(clamp(y / 2, 0, h - 1))
+        win = d[max(0, y - 8):y + 9, max(0, x - 8):x + 9]
+        v = win[win > 0]
+        if v.size < 20:
+            return False
+        self.z, self.cx, self.cy = float(np.median(v)), float(x), float(y)
+        self.box = (0, 0, w, h)                       # first look: anywhere, nearest to the tap wins
+        self.label = label
+        self.locked = self._find(d, grow=False)
+        return self.locked
+
+    def start_box(self, depth, box, label="person"):
+        """Lock onto the nearest thing inside a detector box (full-res pixels)."""
+        d = depth[::2, ::2]
+        h, w = d.shape
+        x1, y1, x2, y2 = [int(v / 2) for v in box]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return False
+        mx, my = (x2 - x1) // 4, (y2 - y1) // 5
+        mid = d[y1 + my:y2 - my, x1 + mx:x2 - mx]
+        v = mid[mid > 0]
+        if v.size < 0.1 * mid.size:
+            return False
+        self.z = float(np.percentile(v, 25))          # the near surface, not the wall seen between the legs
+        self.box, self.cx, self.cy = (x1, y1, x2, y2), (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        self.label = label
+        self.locked = self._find(d, grow=False)
+        return self.locked
+
+    def update(self, depth):
+        """Find the target in a new depth picture. False = not there this frame."""
+        return self.locked and self._find(depth[::2, ::2], grow=True)
+
+    def _find(self, d, grow):
+        h, w = d.shape
+        x1, y1, x2, y2 = self.box
+        gw = int((x2 - x1) * DEPTH_GROW) + 6 if grow else 0
+        gh = int((y2 - y1) * DEPTH_GROW) + 6 if grow else 0
+        rx1, ry1, rx2, ry2 = max(0, x1 - gw), max(0, y1 - gh), min(w, x2 + gw), min(h, y2 + gh)
+        roi = d[ry1:ry2, rx1:rx2]
+        mask = ((roi > self.z - DEPTH_SLAB_MM) & (roi < self.z + DEPTH_SLAB_MM)).astype(np.uint8)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, _K_OPEN)
+        n, lab, stats, cents = cv.connectedComponentsWithStats(mask, 8)
+        best, best_score = 0, None
+        for i in range(1, n):
+            area = stats[i, cv.CC_STAT_AREA]
+            if area < DEPTH_MIN_AREA:
+                continue
+            dist = abs(cents[i][0] + rx1 - self.cx) + 0.5 * abs(cents[i][1] + ry1 - self.cy)
+            score = area - 8.0 * dist                 # big and close to where it was
+            if best_score is None or score > best_score:
+                best, best_score = i, score
+        if not best:
+            return False
+        bx, by, bw, bh, area = stats[best]
+        z = float(np.median(roi[lab == best]))
+        if bw * 2 * z / 1000.0 / FOCAL_PX > DEPTH_MAX_WIDTH_M:
+            return False                              # slid onto a wall or big furniture
+        self.box = (rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh)
+        self.cx, self.cy, self.area, self.z = cents[best][0] + rx1, cents[best][1] + ry1, int(area), z
+        return True
+
+    # full-resolution views
+    @property
+    def dist(self):
+        return self.z / 1000.0
+
+    @property
+    def center(self):
+        return self.cx * 2.0, self.cy * 2.0
+
+    @property
+    def rect(self):
+        return tuple(int(v * 2) for v in self.box)
+
+
+def box_depth(depth, box):
+    """Distance (m) of the nearest surface in the middle of a detector box, or None."""
+    x1, y1, x2, y2 = [int(v) for v in box]
+    mx, my = (x2 - x1) // 4, (y2 - y1) // 5
+    mid = depth[max(0, y1 + my):max(0, y2 - my):2, max(0, x1 + mx):max(0, x2 - mx):2]
+    v = mid[mid > 0]
+    if mid.size == 0 or v.size < 0.1 * mid.size:
+        return None
+    return float(np.percentile(v, 25)) / 1000.0
+
+
+def motion_blob(depth, ref):
+    """Where did something walk in? Compares a depth picture with an earlier one
+    taken while the robot stood still. Returns the (x, y) pixel of the biggest
+    area that is now clearly nearer, or None."""
+    d, r = depth[::2, ::2], ref[::2, ::2]
+    nearer = (d > 0) & (d < 3500) & ((r == 0) | (d.astype(np.int32) < r.astype(np.int32) - MOTION_MM))
+    mask = cv.morphologyEx(nearer.astype(np.uint8), cv.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n, lab, stats, cents = cv.connectedComponentsWithStats(mask, 8)
+    if n < 2:
+        return None
+    i = 1 + int(np.argmax(stats[1:, cv.CC_STAT_AREA]))
+    if stats[i, cv.CC_STAT_AREA] < MOTION_MIN_AREA:
+        return None
+    ys, xs = np.nonzero(lab == i)
+    k = len(xs) // 2                                    # a pixel that really is on the blob
+    order = np.argsort(xs)
+    return float(xs[order[k]] * 2), float(ys[order[k]] * 2)
+
+
+def depth_cmd(cx, dist, frame_w, target_dist, max_fwd, max_turn):
+    """Steer toward a target at pixel column cx and keep target_dist metres away."""
+    ex = (cx - frame_w / 2.0) / (frame_w / 2.0)
+    vz = 0.0 if abs(ex) < TURN_DEADBAND else clamp(-TURN_GAIN * 0.8 * ex, -max_turn, max_turn)
+    err = dist - target_dist
+    vx = 0.0 if abs(err) < DIST_DEADBAND else clamp(DIST_GAIN * err, -MAX_REVERSE, max_fwd)
+    if vx > 0:
+        vx *= max(0.0, 1.0 - abs(ex))
+    return float(vx), float(vz), float(ex)
+
+
 def lidar_guard(vx, front, rear):
     """Limit forward/backward speed by what the lidar sees. Returns (vx, note).
 
@@ -262,19 +416,18 @@ class Recovery(object):
         self.__init__()
         self.t = now
 
-    def seen(self, now, det, frame_w, frame_h, target_size, vz_cmd):
-        cx, cy, size = det
-        ex = (cx - frame_w / 2.0) / (frame_w / 2.0)
+    def seen(self, now, ex, close, vz_cmd):
+        """ex: target's horizontal position (-1 left .. +1 right). close: it is so
+        near that losing it probably means it slipped under/inside the camera's view."""
         dt = now - self.t
         if self._have and 0.005 < dt < 0.3:
-            # Turning left (vz > 0) slides a still toy to the right in the
-            # picture; take that out so we measure the toy, not ourselves.
+            # Turning left (vz > 0) slides a still target to the right in the
+            # picture; take that out so we measure the target, not ourselves.
             v = (ex - self.ex) / dt - vz_cmd / HALF_FOV
             self.vex = 0.6 * self.vex + 0.4 * clamp(v, -6.0, 6.0)
         else:
             self.vex = 0.0
-        low, top = (cy + size / 2.0) / frame_h, (cy - size / 2.0) / frame_h
-        self.close = low >= NEAR_EDGE or top <= 0.02 or size > 1.5 * target_size * frame_w
+        self.close = close
         self.t, self.ex, self.plan, self._have = now, ex, None, True
 
     def cmd(self, now):
@@ -388,6 +541,13 @@ class FollowBot(object):
         self._want_distance = False
         self.show_mask = False
         self.raw = None
+        # "shape" = follow a person/thing through the depth camera; "colour" = follow a colour
+        self.mode = "shape" if hasattr(camera, "depth") else "colour"
+        self.target = DepthTarget()
+        self.target_dist = FOLLOW_DIST
+        self.detector = None            # set later if the object finder loads
+        self.detector_note = "off"
+        self._tap = None
 
     # ---- called from the web threads ----
     def set_following(self, on):
@@ -399,6 +559,20 @@ class FollowBot(object):
     def set_color(self, name):
         with self.lock:
             self.color_name, self.ranges, self.message = name, COLORS[name], ""
+            self.mode = "colour"
+
+    def set_mode(self, mode):
+        with self.lock:
+            if mode == "shape" and not hasattr(self.cam, "depth"):
+                self.message = "No depth camera, so I can only follow colours."
+                return
+            self.mode, self.message = mode, ""
+            self.target.locked = False
+
+    def tap(self, fx, fy):
+        """The picture was tapped at (fx, fy), each 0..1."""
+        with self.lock:
+            self._tap = (clamp(fx, 0.0, 1.0) * PROC_W, clamp(fy, 0.0, 1.0) * PROC_H)
 
     def set_speed(self, name):
         with self.lock:
@@ -426,7 +600,9 @@ class FollowBot(object):
 
     def snapshot(self):
         with self.lock:
-            return {"following": self.following, "color": self.color_name,
+            return {"following": self.following, "color": self.color_name if self.mode == "colour" else "",
+                    "mode": self.mode, "target": self.target.label if self.target.locked else "",
+                    "finder": self.detector_note,
                     "speed": self.speed_name, "status": self.status,
                     "message": self.message, "mask": self.show_mask, "battery": self.drive.battery()}
 
@@ -442,6 +618,10 @@ class FollowBot(object):
         was_visible, prev, shown, streak = False, None, None, 0
         vx_s, vz_s = 0.0, 0.0
         fails = 0
+        last_ok = 0.0            # shape mode: when the target was last found
+        still_since = None       # when the robot last came to rest
+        ref, ref_t = None, 0.0   # depth picture to compare against for "something walked in"
+        det_seq = -1
         while self.running:
             ok, raw = self.cam.get_frame()
             if not ok:
@@ -459,6 +639,11 @@ class FollowBot(object):
                 continue
             fails = 0
             frame = raw if raw.shape[:2] == (PROC_H, PROC_W) else cv.resize(raw, (PROC_W, PROC_H))
+            depth = self.cam.depth() if hasattr(self.cam, "depth") else None
+            if depth is not None and depth.shape != (PROC_H, PROC_W):
+                depth = None
+            if self.detector is not None:
+                self.detector.submit(frame)
 
             with self.lock:
                 if self._want_learn:
@@ -466,79 +651,171 @@ class FollowBot(object):
                     ranges, msg = learn_color(frame)
                     self.message = msg
                     if ranges:
-                        self.ranges, self.color_name = ranges, "learned"
+                        self.ranges, self.color_name, self.mode = ranges, "learned", "colour"
+                tap, self._tap = self._tap, None
+                if tap is not None:
+                    # Tap = "follow this". By shape if the depth camera can see it, else by its colour.
+                    if depth is not None and self.target.start_at(depth, tap[0], tap[1]):
+                        self.mode, self.message = "shape", "OK! Following that (%.1f m away)." % self.target.dist
+                        last_ok = time.time()
+                    else:
+                        ranges, msg = learn_color(frame, at=tap)
+                        if ranges:
+                            self.ranges, self.color_name, self.mode = ranges, "learned", "colour"
+                            self.message = "OK! Following that colour."
+                        else:
+                            self.message = "I can't make that out. Tap something closer or more colourful."
                 following, ranges, show_mask = self.following, self.ranges, self.show_mask
+                mode = self.mode
                 self.raw = frame
                 max_fwd, max_turn = SPEEDS[self.speed_name]
-                target = self.target_size
+                target, target_dist = self.target_size, self.target_dist
 
-            det, mask = detect(frame, ranges, prev)
             now = time.time()
-            if det:
-                prev = (det[0], det[1])
-            elif now - rec.t > 1.0:
-                prev = None
             frame = frame.copy()                      # keep self.raw free of drawings
-            if show_mask:
-                frame[mask > 0] = (0, 255, 0)
-            streak = streak + 1 if det else 0
-            blip = det if (det and not was_visible and streak < CONFIRM_FRAMES) else None
-            if blip:
-                det = None                            # not convinced yet; carry on as if unseen
             vx = vz = 0.0
             note = ""
-            if not following:
-                status = "idle"
-                rec.idle(now)                         # pressing GO with no toy in view starts a scan
-            elif det:
-                vx, vz = compute_cmd(det, PROC_W, PROC_H, target, max_fwd, max_turn)
-                rec.seen(now, det, PROC_W, PROC_H, target, vz_s)
-                status = "follow"
-                if not was_visible:
-                    self.drive.beep()
-                    print("[follow_bot] saw toy at x=%d y=%d, %d px wide" % det, flush=True)
-                    self._save_frame(frame, det, now)
-            elif self.search:
-                vx, vz, status, note = rec.cmd(now)
-                if blip:
-                    vz = 0.0                          # hold still for a proper look
+            det = blip = None                         # (cx, cy, size) of what is being followed
+            people = []
+
+            if mode == "shape":
+                tgt = self.target
+                if self.detector is not None:
+                    dets, dets_t, seq = self.detector.results()
+                    if now - dets_t < 0.6:
+                        people = [d for d in dets if d["cls"] == "person"]
+                found = tgt.locked and depth is not None and tgt.update(depth)
+                if found:
+                    last_ok = now
+                elif tgt.locked and now - last_ok > LOST_GRACE_S:
+                    tgt.locked = False
+                    print("[follow_bot] lost the %s" % tgt.label, flush=True)
+
+                # Nothing locked: try to pick a target up.
+                if following and not tgt.locked and depth is not None:
+                    if people and self.detector is not None and seq != det_seq:
+                        det_seq = seq
+                        near = [(box_depth(depth, d["box"]), d) for d in people]
+                        near = sorted([n for n in near if n[0] is not None and n[0] < 4.5], key=lambda n: n[0])
+                        if near and tgt.start_box(depth, near[0][1]["box"], "person"):
+                            found, last_ok = True, now
+                    if not tgt.locked and still_since is not None and now - still_since > 0.7:
+                        if ref is None or now - ref_t > 3.0:
+                            ref, ref_t = depth, now       # fresh "before" picture
+                        else:
+                            spot = motion_blob(depth, ref)
+                            if spot and tgt.start_at(depth, spot[0], spot[1], "visitor"):
+                                found, last_ok = True, now
+                    if found:
+                        self.drive.beep()
+                        print("[follow_bot] picked up a %s at %.2f m" % (tgt.label, tgt.dist), flush=True)
+
+                if not following:
+                    status = "idle"
+                    rec.idle(now)
+                elif found:
+                    cx, cy = tgt.center
+                    x1, y1, x2, y2 = tgt.rect
+                    det = (cx, cy, x2 - x1)
+                    vx, vz, ex = depth_cmd(cx, tgt.dist, PROC_W, target_dist, max_fwd, max_turn)
+                    rec.seen(now, ex, tgt.dist < 0.9, vz_s)
+                    status = "follow"
+                    note = "%s %.1fm" % (tgt.label, tgt.dist)
+                    if not was_visible:
+                        self._save_frame(frame, det, now)
+                elif tgt.locked:
+                    status = "follow"                 # missed a frame or two; hold still
+                elif self.search and (rec._have or self.detector is not None):
+                    # Lost it, or GO with nobody in view and a person finder to look with: turn and look.
+                    vx, vz, status, note = rec.cmd(now)
+                else:
+                    status = "waiting"
+                if status == "lost":                  # gave up looking: stand still and watch for a visitor
+                    status, note = "waiting", ""
             else:
-                status = "follow" if now - rec.t < LOST_GRACE_S else "lost"
+                det, mask = detect(frame, ranges, prev)
+                if det:
+                    prev = (det[0], det[1])
+                elif now - rec.t > 1.0:
+                    prev = None
+                if show_mask:
+                    frame[mask > 0] = (0, 255, 0)
+                streak = streak + 1 if det else 0
+                blip = det if (det and not was_visible and streak < CONFIRM_FRAMES) else None
+                if blip:
+                    det = None                        # not convinced yet; carry on as if unseen
+                if not following:
+                    status = "idle"
+                    rec.idle(now)                     # pressing GO with no toy in view starts a scan
+                elif det:
+                    vx, vz = compute_cmd(det, PROC_W, PROC_H, target, max_fwd, max_turn)
+                    cx, cy, size = det
+                    low, top = (cy + size / 2.0) / PROC_H, (cy - size / 2.0) / PROC_H
+                    rec.seen(now, (cx - PROC_W / 2.0) / (PROC_W / 2.0),
+                             low >= NEAR_EDGE or top <= 0.02 or size > 1.5 * target * PROC_W, vz_s)
+                    status = "follow"
+                    if not was_visible:
+                        self.drive.beep()
+                        print("[follow_bot] saw toy at x=%d y=%d, %d px wide" % det, flush=True)
+                        self._save_frame(frame, det, now)
+                elif self.search:
+                    vx, vz, status, note = rec.cmd(now)
+                    if blip:
+                        vz = 0.0                      # hold still for a proper look
+                else:
+                    status = "follow" if now - rec.t < LOST_GRACE_S else "lost"
+
             if self.lidar is not None:
                 front, rear = self.lidar.clearance()
                 vx, guard = lidar_guard(vx, front, rear)
                 if guard:
                     note = (note + " " + guard).strip()
-            if (status, note) != shown:               # one terminal line per change, for debugging
-                shown = (status, note)
+            key = (status, note.split(" ")[0] if status == "follow" else note)
+            if key != shown:                          # one terminal line per change, for debugging
+                shown = key
                 print("[follow_bot] %s %s" % (status, note), flush=True)
             was_visible = det is not None
 
             # Ease into motion, but stop instantly.
             vx_s = 0.0 if vx == 0 else 0.6 * vx_s + 0.4 * vx
             vz_s = 0.0 if vz == 0 else 0.5 * vz_s + 0.5 * vz
+            if vx_s == 0 and vz_s == 0:
+                still_since = still_since or now
+            else:
+                still_since, ref = None, None
 
             with self.lock:
                 still_following = self.following      # STOP may have arrived mid-frame
                 if self._want_distance:
                     self._want_distance = False
-                    if det:
+                    if mode == "shape" and self.target.locked:
+                        self.target_dist = clamp(self.target.dist, 0.8, 3.0)
+                        self.message = "OK, I'll stay %.1f m away." % self.target_dist
+                    elif mode == "colour" and det:
                         self.target_size = clamp(det[2] / PROC_W, 0.03, 0.6)
                         self.message = "OK, I'll stay this far away."
                     else:
-                        self.message = "I can't see it. Show me the toy first."
+                        self.message = "I can't see it. Show me what to follow first."
                 self.status = status
             if still_following:
                 self.drive.move(vx_s, vz_s)
             else:
                 self.drive.stop()
                 vx_s = vz_s = 0.0
-            self.drive.light(status)
+            self.drive.light("lost" if status == "waiting" else status)
 
-            self._draw(frame, det or blip, (status + " " + note).strip(), following)
+            for d in people:
+                x1, y1, x2, y2 = [int(v) for v in d["box"]]
+                cv.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 1)
+            if mode == "shape" and self.target.locked:
+                x1, y1, x2, y2 = self.target.rect
+                cv.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                self._draw(frame, None, (status + " " + note).strip(), True)
+            else:
+                self._draw(frame, det or blip, (status + " " + note).strip(), following or mode == "shape")
             if self.lidar is not None:
                 self._draw_radar(frame)
-            if hasattr(self.cam, "depth"):
+            if depth is not None or hasattr(self.cam, "depth"):
                 self._draw_depth(frame)
             ok, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
             if ok:
@@ -635,11 +912,15 @@ PAGE = """<!doctype html>
   small{opacity:.7}
 </style></head><body>
 <h1>&#129302; Follow Bot</h1>
-<img src="/video_feed" alt="robot camera">
+<img id="cam" src="/video_feed" alt="robot camera">
+<small>Tap anything in the picture to follow it</small>
 <div id="status">&nbsp;</div>
 <div class="row">
   <button id="go" onclick="post('start')">GO!</button>
   <button id="stop" onclick="post('stop')">STOP</button>
+</div>
+<div class="row">
+  <button id="shape" onclick="post('mode/shape')">&#128694; Follow people and things</button>
 </div>
 <div class="row" id="colors">
   <button data-c="red" style="background:#d62828">Red</button>
@@ -663,18 +944,26 @@ PAGE = """<!doctype html>
 <small id="batt"></small>
 <p><a href="/lidar" style="color:#9cc3ff">Lidar view</a></p>
 <script>
-const words = {idle:"Press GO and show me the toy!", follow:"I see it! Following...",
+const words = {idle:"Press GO, then tap what to follow or walk in front of me!", follow:"I see it! Following...",
+               waiting:"Tap what to follow, or walk in front of me!",
                search:"Where did it go? Looking...", backup:"Oops, too close! Backing up...", lost:"I can't find it. Show me the toy!",
                "no camera":"My camera is not working."};
 function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show); }
 function show(s){
-  document.getElementById('status').textContent = s.message || words[s.status] || s.status;
+  let t = s.message || words[s.status] || s.status;
+  if (!s.message && s.status=='follow' && s.target) t = "Following the "+s.target+"!";
+  document.getElementById('status').textContent = t;
+  document.getElementById('shape').classList.toggle('on', s.mode=='shape');
   document.querySelectorAll('[data-c]').forEach(b=>b.classList.toggle('on', b.dataset.c==s.color));
   document.querySelectorAll('[data-s]').forEach(b=>b.classList.toggle('on', b.dataset.s==s.speed));
   document.getElementById('go').classList.toggle('on', s.following);
   document.getElementById('mask').classList.toggle('on', s.mask);
-  document.getElementById('batt').textContent = s.battery ? 'Battery '+s.battery+' V' : '';
+  document.getElementById('batt').textContent = (s.battery ? 'Battery '+s.battery+' V   ' : '') + 'Person finder: '+s.finder;
 }
+document.getElementById('cam').addEventListener('click', e=>{
+  const r=e.target.getBoundingClientRect();
+  post('tap/'+((e.clientX-r.left)/r.width).toFixed(4)+'/'+((e.clientY-r.top)/r.height).toFixed(4));
+});
 document.querySelectorAll('#colors [data-c]').forEach(b=>b.onclick=()=>post('color/'+b.dataset.c));
 document.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>post('speed/'+b.dataset.s));
 setInterval(()=>fetch('/api/status').then(r=>r.json()).then(show).catch(()=>{}), 700);
@@ -751,6 +1040,18 @@ def make_app(fb):
             fb.set_color(name)
         return jsonify(fb.snapshot())
 
+    @app.route("/api/mode/<name>", methods=["POST"])
+    def mode(name):
+        if name in ("shape", "colour"):
+            fb.set_mode(name)
+        return jsonify(fb.snapshot())
+
+    @app.route("/api/tap/<float:fx>/<float:fy>", methods=["POST"])
+    def tap(fx, fy):
+        fb.tap(fx, fy)
+        time.sleep(0.2)                # let the camera loop act on it
+        return jsonify(fb.snapshot())
+
     @app.route("/api/speed/<name>", methods=["POST"])
     def speed(name):
         if name in SPEEDS:
@@ -820,7 +1121,7 @@ def open_camera(which, debug):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Rosmaster X3 colour follow bot")
+    ap = argparse.ArgumentParser(description="Rosmaster X3 follow bot")
     ap.add_argument("--camera", default="auto",
                     help="auto (default: Orbbec SDK if installed, else OpenCV), opencv, usb, or a /dev/video index")
     ap.add_argument("--port", type=int, default=6501)
@@ -833,6 +1134,8 @@ def main():
                     help="lidar angle that points straight ahead of the robot (tools/pi.sh calibrate)")
     ap.add_argument("--no-lidar", action="store_true", help="ignore the lidar even if it is plugged in")
     ap.add_argument("--lidar-port", default="/dev/rplidar")
+    ap.add_argument("--no-finder", action="store_true",
+                    help="don't load the person finder (YOLO); people are then picked up by tapping or walking in")
     ap.add_argument("--save-frames", default=None, metavar="DIR",
                     help="save a picture to DIR each time something is taken for the toy (last 40 kept)")
     ap.add_argument("--debug", action="store_true")
@@ -855,6 +1158,21 @@ def main():
             print("[follow_bot] lidar NOT available (%s); it will refuse to reverse" % e, flush=True)
             lidar = Lidar(args.lidar_port, front_deg=args.lidar_front)     # never started: reports no data
     fb = FollowBot(cam, drive, target_size=args.target_size, search=not args.no_search, lidar=lidar)
+
+    def load_finder():
+        # torch + YOLO take a while to import, so load them while the bot is already usable.
+        try:
+            fb.detector_note = "loading"
+            from detector import YoloDetector
+            fb.detector = YoloDetector()
+            fb.detector_note = "on"
+            print("[follow_bot] person finder ready", flush=True)
+        except Exception as e:
+            fb.detector_note = "not available"
+            print("[follow_bot] person finder not available: %s" % (str(e).splitlines() or [repr(e)])[0], flush=True)
+
+    if not args.no_finder and fb.mode == "shape":
+        threading.Thread(target=load_finder, daemon=True).start()
 
     if args.save_frames:
         os.makedirs(args.save_frames, exist_ok=True)
