@@ -27,6 +27,9 @@ deploy)
 run)
     shift
     deploy || exit 1
+    # An earlier copy still running (e.g. in another SSH window) holds the camera.
+    # Ask it to stop politely (SIGINT) so it can stop the wheels; never kill -9.
+    ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && echo "Stopped a follow bot that was already running" && sleep 2'
     echo "Running on the robot. Ctrl+C here stops it (and the wheels). Log: pi_reports/follow.log"
     # -tt so Ctrl+C reaches the robot and follow_bot.py can stop the motors cleanly.
     ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; python3 -u follow_bot.py $*" 2>&1 | tee "$OUT/follow.log"
