@@ -95,10 +95,9 @@ SCAN_REST_S = 1.0       # short rest; the next sweep goes the other way
 SCAN_GIVE_UP_S = 30.0   # then wait quietly until the toy shows up again
 # Following by shape (depth camera): the target is whatever blob of similar
 # distance sits where the target was a moment ago.
-FOLLOW_DIST = 0.8       # m to keep from a person/thing followed by shape (the depth camera
-                        # cannot measure nearer than about 0.6 m, so this is close to its limit)
+FOLLOW_DIST = 1.2       # m to keep from a person/thing followed by shape
 DIST_GAIN = 0.6         # m/s per metre of distance error
-DIST_DEADBAND = 0.10    # m
+DIST_DEADBAND = 0.15    # m
 DEPTH_SLAB_MM = 350     # the target's blob = pixels within this of its last distance
 DEPTH_GROW = 0.35       # look this much beyond the last box (each side) for the blob
 DEPTH_MIN_AREA = 150    # blob pixels at half resolution
@@ -969,7 +968,7 @@ class FollowBot(object):
                     x1, y1, x2, y2 = tgt.rect
                     det = (cx, cy, x2 - x1)
                     vx, vz, ex = depth_cmd(cx, tgt.dist, PROC_W, target_dist, max_fwd, max_turn)
-                    rec.seen(now, ex, tgt.dist < 0.75, vz_s)
+                    rec.seen(now, ex, tgt.dist < 0.9, vz_s)
                     status = "follow"
                     note = "%s %.1fm" % (tgt.label, tgt.dist)
                 elif tgt.locked:
