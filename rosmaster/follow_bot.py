@@ -73,6 +73,10 @@ CLIP_EDGE = 0.985       # toy cut off by the bottom of the picture: back away
 # When the toy vanishes while close (or out of the top), back up to widen the view.
 BACKUP_SPEED = 0.08     # m/s
 BACKUP_S = 2.0          # at most this long (about 16 cm)
+# Lidar guard (only with --lidar-front). Distances are measured from the lidar,
+# which sits in the middle of the robot, so they include half the robot's length.
+LIDAR_STOP = 0.40       # m. Something this close in the robot's lane: don't move that way
+LIDAR_SLOW = 0.80       # m. Start slowing down from here
 HALF_FOV = 0.55         # rad, roughly half the camera's horizontal field of view
 PREDICT_S = 0.6         # how far ahead to extrapolate the toy's sideways motion
 # Searching for a lost toy: turn a bit, stop and look, turn a bit more...
@@ -195,6 +199,23 @@ def compute_cmd(det, frame_w, frame_h, target_size, max_fwd, max_turn):
     elif low >= NEAR_EDGE:
         vx = min(vx, 0.0)
     return vx, vz
+
+
+def lidar_guard(vx, front, rear):
+    """Limit forward/backward speed by what the lidar sees. Returns (vx, note).
+
+    front/rear are free distances in metres, or None if the lidar has no data.
+    Without data, driving forward is left to the camera but reversing (which
+    the camera cannot see) is refused.
+    """
+    if vx > 0 and front is not None:
+        if front <= LIDAR_STOP:
+            return 0.0, "blocked ahead"
+        if front < LIDAR_SLOW:
+            return vx * (front - LIDAR_STOP) / (LIDAR_SLOW - LIDAR_STOP), ""
+    if vx < 0 and (rear is None or rear <= LIDAR_STOP):
+        return 0.0, "blocked behind"
+    return vx, ""
 
 
 def scan_cmd(t, direction):
@@ -334,9 +355,10 @@ class Drive(object):
 
 
 class FollowBot(object):
-    def __init__(self, camera, drive, target_size=0.10, search=True):
+    def __init__(self, camera, drive, target_size=0.10, search=True, lidar=None):
         self.cam = camera
         self.drive = drive
+        self.lidar = lidar
         self.search = search
         self.lock = threading.Lock()
         self.running = True
@@ -467,6 +489,11 @@ class FollowBot(object):
                 vz = clamp(vz, -max_turn, max_turn)
             else:
                 status = "follow" if now - rec.t < LOST_GRACE_S else "lost"
+            if self.lidar is not None:
+                front, rear = self.lidar.clearance()
+                vx, guard = lidar_guard(vx, front, rear)
+                if guard:
+                    note = (note + " " + guard).strip()
             if (status, note) != shown:               # one terminal line per change, for debugging
                 shown = (status, note)
                 print("[follow_bot] %s %s" % (status, note), flush=True)
@@ -666,6 +693,10 @@ def main():
     ap.add_argument("--no-search", action="store_true", help="don't turn around looking for a lost toy")
     ap.add_argument("--target-size", type=float, default=0.10,
                     help="how big the toy should look, as a fraction of picture width (bigger = closer)")
+    ap.add_argument("--lidar-front", type=float, default=None, metavar="DEG",
+                    help="use the lidar to avoid obstacles; DEG is the lidar angle that points "
+                         "straight ahead of the robot (see lidar.py)")
+    ap.add_argument("--lidar-port", default="/dev/rplidar")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -674,11 +705,22 @@ def main():
         raise SystemExit("Camera '%s' did not open. Is rosmaster_main.py still running? "
                          "(bash rosmaster/kill_rosmaster.sh)" % args.camera)
     drive = Drive(enabled=not args.no_motors, invert_turn=args.invert_turn, debug=args.debug)
-    fb = FollowBot(cam, drive, target_size=args.target_size, search=not args.no_search)
+    lidar = None
+    if args.lidar_front is not None:
+        from lidar import Lidar
+        try:
+            lidar = Lidar(args.lidar_port, front_deg=args.lidar_front).start()
+            print("[follow_bot] lidar on, front at %.0f deg" % args.lidar_front, flush=True)
+        except Exception as e:
+            print("[follow_bot] lidar NOT available (%s); it will refuse to reverse" % e, flush=True)
+            lidar = Lidar(args.lidar_port, front_deg=args.lidar_front)     # never started: reports no data
+    fb = FollowBot(cam, drive, target_size=args.target_size, search=not args.no_search, lidar=lidar)
 
     def shutdown(*_):
         fb.running = False
         drive.shutdown()
+        if lidar is not None:
+            lidar.stop()
 
     atexit.register(shutdown)
     signal.signal(signal.SIGTERM, lambda *_: (shutdown(), exit(0)))

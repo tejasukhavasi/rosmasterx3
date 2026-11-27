@@ -1,11 +1,12 @@
 #!/bin/bash
 # Helper for working on the robot from the Mac. Run from anywhere:
 #
-#   tools/pi.sh deploy   copy follow_bot.py to the robot
+#   tools/pi.sh deploy   copy follow_bot.py and lidar.py to the robot
 #   tools/pi.sh run      deploy, then run the follow bot; its log is saved in pi_reports/follow.log
 #   tools/pi.sh snap     save a camera frame from the running follow bot to pi_reports/
 #   tools/pi.sh diag     collect hardware info from the robot into pi_reports/diag.txt
 #   tools/pi.sh lidar    identify the lidar on /dev/rplidar into pi_reports/lidar.txt
+#   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
 # Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
 # Set PI=pi@<ip> if yahboom.local does not resolve.
@@ -18,7 +19,7 @@ OUT="$REPO/pi_reports"
 mkdir -p "$OUT"
 
 deploy() {
-    scp -q "$REPO/rosmaster/follow_bot.py" "$PI:$REMOTE_DIR/" && echo "Copied follow_bot.py to $PI"
+    scp -q "$REPO/rosmaster/follow_bot.py" "$REPO/rosmaster/lidar.py" "$PI:$REMOTE_DIR/" && echo "Copied follow_bot.py and lidar.py to $PI"
 }
 
 case "$1" in
@@ -38,6 +39,11 @@ run)
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
+    ;;
+scan)
+    deploy || exit 1
+    ssh "$PI" "cd $REMOTE_DIR && python3 -u lidar.py" 2>&1 | tee "$OUT/scan.txt"
+    echo "Saved pi_reports/scan.txt"
     ;;
 lidar)
     scp -q "$REPO/tools/lidar_probe.py" "$PI:/tmp/" && ssh "$PI" "python3 -u /tmp/lidar_probe.py" 2>&1 | tee "$OUT/lidar.txt"
@@ -65,6 +71,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
