@@ -143,6 +143,20 @@ try:
                 color, depth = sdk_both(pipeline, depth_profile, color_profile, align)
                 if color is not None and depth is not None:
                     save(color, depth, tag)
+                    # Second pair with the depth "soft filter" off. The filter removes
+                    # small isolated patches, which may include a small ball.
+                    prop = getattr(ob.OBPropertyID, "OB_PROP_DEPTH_SOFT_FILTER_BOOL", None)
+                    try:
+                        dev = pipeline.get_device()
+                        dev.set_bool_property(prop, False)
+                        say("soft filter now:", dev.get_bool_property(prop))
+                        time.sleep(0.3)
+                        color, depth = sdk_both(pipeline, depth_profile, color_profile, align)
+                        if color is not None and depth is not None:
+                            save(color, depth, tag + "-nofilter")
+                        dev.set_bool_property(prop, True)
+                    except Exception as e:
+                        say("   no-filter attempt failed: %s" % first_line(e))
                     sys.exit(0)
             except SystemExit:
                 raise
