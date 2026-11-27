@@ -59,7 +59,16 @@ TURN_GAIN = 2.0         # rad/s per unit of horizontal error (-1..1)
 DRIVE_GAIN = 0.45       # m/s per unit of relative size error
 TURN_DEADBAND = 0.08    # fraction of half-frame
 DRIVE_DEADBAND = 0.12   # relative size error
-LOST_GRACE_S = 0.5      # coast-free pause before deciding the target is gone
+LOST_GRACE_S = 0.4      # coast-free pause before deciding the target is gone
+# The camera can't see the floor right in front of the robot, so a toy low in
+# the picture is about to disappear underneath it.
+NEAR_EDGE = 0.90        # toy's lower edge below this fraction of the picture: don't advance
+CLIP_EDGE = 0.985       # toy cut off by the bottom of the picture: back away
+# When the toy vanishes while close (or out of the top), back up to widen the view.
+BACKUP_SPEED = 0.08     # m/s
+BACKUP_S = 2.0          # at most this long (about 16 cm)
+HALF_FOV = 0.55         # rad, roughly half the camera's horizontal field of view
+PREDICT_S = 0.6         # how far ahead to extrapolate the toy's sideways motion
 # Searching for a lost toy: turn a bit, stop and look, turn a bit more...
 SCAN_TURN = 0.9         # rad/s while turning
 SCAN_STEP_S = 0.7       # turn this long (about 35 degrees, less than the camera's view)
@@ -151,9 +160,9 @@ def clamp(x, lo, hi):
 # ----------------------------------------------------------------------------
 # Control
 # ----------------------------------------------------------------------------
-def compute_cmd(det, frame_w, target_size, max_fwd, max_turn):
+def compute_cmd(det, frame_w, frame_h, target_size, max_fwd, max_turn):
     """Turn a detection into (vx m/s, vz rad/s). vz > 0 turns left (ROS style)."""
-    cx, _, size = det
+    cx, cy, size = det
     ex = (cx - frame_w / 2.0) / (frame_w / 2.0)        # -1 left .. +1 right
     vz = 0.0 if abs(ex) < TURN_DEADBAND else clamp(-TURN_GAIN * ex, -max_turn, max_turn)
 
@@ -162,30 +171,87 @@ def compute_cmd(det, frame_w, target_size, max_fwd, max_turn):
     vx = 0.0 if abs(es) < DRIVE_DEADBAND else clamp(DRIVE_GAIN * es, -MAX_REVERSE, max_fwd)
     if vx > 0:
         vx *= max(0.0, 1.0 - abs(ex))                   # face it first, then drive
+
+    # A toy sliding out of the bottom of the picture looks SMALLER (it is cut
+    # off), which would otherwise read as "far away, drive forward".
+    low = (cy + size / 2.0) / frame_h
+    if low >= CLIP_EDGE:
+        vx = -BACKUP_SPEED
+    elif low >= NEAR_EDGE:
+        vx = min(vx, 0.0)
     return vx, vz
 
 
-def search_cmd(t_lost, last_ex):
-    """What to do t_lost seconds after the toy vanished. Returns (vz, status).
+def scan_cmd(t, direction):
+    """Turn-and-look search, t seconds after it began. Returns (vz, status).
 
-    Starts turning toward the side where the toy was last seen.
+    direction is +1 to start turning left, -1 to start turning right.
     """
-    t = t_lost - LOST_GRACE_S
-    if t < 0:
-        return 0.0, "follow"
     if t > SCAN_GIVE_UP_S:
         return 0.0, "lost"
     sweep, tc = divmod(t, SCAN_SWEEP_S + SCAN_REST_S)
     if tc >= SCAN_SWEEP_S or (tc % (SCAN_STEP_S + SCAN_LOOK_S)) >= SCAN_STEP_S:
         return 0.0, "search"                               # resting or looking
-    direction = -math.copysign(1.0, last_ex) * (1.0 if int(sweep) % 2 == 0 else -1.0)
-    return direction * SCAN_TURN, "search"
+    return direction * (1.0 if int(sweep) % 2 == 0 else -1.0) * SCAN_TURN, "search"
+
+
+class Recovery(object):
+    """Remembers how the toy was moving and decides what to do once it is gone.
+
+    - Toy was close, low in the picture, or left through the top: back up a
+      little first, which widens what the camera sees.
+    - Otherwise turn the way the toy was heading, then scan all around.
+    """
+
+    def __init__(self):
+        self.t = 0.0          # when the toy was last seen (or GO was pressed)
+        self.ex = 0.0         # last horizontal position, -1 left .. +1 right
+        self.vex = 0.0        # sideways speed with the robot's own turning removed
+        self.close = False
+        self.plan = None
+        self._have = False
+
+    def idle(self, now):
+        """Not following: forget everything, so GO starts with a plain scan."""
+        self.__init__()
+        self.t = now
+
+    def seen(self, now, det, frame_w, frame_h, target_size, vz_cmd):
+        cx, cy, size = det
+        ex = (cx - frame_w / 2.0) / (frame_w / 2.0)
+        dt = now - self.t
+        if self._have and 0.005 < dt < 0.3:
+            # Turning left (vz > 0) slides a still toy to the right in the
+            # picture; take that out so we measure the toy, not ourselves.
+            v = (ex - self.ex) / dt - vz_cmd / HALF_FOV
+            self.vex = 0.6 * self.vex + 0.4 * clamp(v, -6.0, 6.0)
+        else:
+            self.vex = 0.0
+        low, top = (cy + size / 2.0) / frame_h, (cy - size / 2.0) / frame_h
+        self.close = low >= NEAR_EDGE or top <= 0.02 or size > 1.5 * target_size * frame_w
+        self.t, self.ex, self.plan, self._have = now, ex, None, True
+
+    def cmd(self, now):
+        """Returns (vx, vz, status, note) for a frame with no toy in it."""
+        if now - self.t < LOST_GRACE_S:
+            return 0.0, 0.0, "follow", ""
+        if self.plan is None:
+            guess = self.ex + self.vex * PREDICT_S          # where it was heading
+            if abs(guess) < 0.15:
+                guess = self.ex if abs(self.ex) > 0.05 else -1.0
+            self.plan = {"t0": now, "dir": -math.copysign(1.0, guess),
+                         "backup": BACKUP_S if (self.close and self._have) else 0.0}
+        t = now - self.plan["t0"]
+        if t < self.plan["backup"]:
+            return -BACKUP_SPEED, 0.0, "backup", "too close"
+        vz, status = scan_cmd(t - self.plan["backup"], self.plan["dir"])
+        return 0.0, vz, status, "left" if self.plan["dir"] > 0 else "right"
 
 
 class Drive(object):
     """Thin wrapper over Rosmaster_Lib so the rest can run without the robot."""
 
-    LIGHTS = {"idle": (0, 0, 60), "follow": (0, 120, 0), "search": (120, 90, 0), "lost": (120, 0, 0)}
+    LIGHTS = {"idle": (0, 0, 60), "follow": (0, 120, 0), "search": (120, 90, 0), "backup": (120, 40, 0), "lost": (120, 0, 0)}
 
     def __init__(self, enabled, invert_turn=False, debug=False):
         self.bot = None
@@ -322,7 +388,8 @@ class FollowBot(object):
             self.drive.stop()          # any crash here must leave the wheels stopped
 
     def _loop(self):
-        last_seen, last_ex, was_visible, prev = 0.0, 0.0, False, None
+        rec = Recovery()
+        was_visible, prev, shown = False, None, None
         vx_s, vz_s = 0.0, 0.0
         fails = 0
         while self.running:
@@ -359,28 +426,30 @@ class FollowBot(object):
             now = time.time()
             if det:
                 prev = (det[0], det[1])
-            elif now - last_seen > 1.0:
+            elif now - rec.t > 1.0:
                 prev = None
             frame = frame.copy()                      # keep self.raw free of drawings
             if show_mask:
                 frame[mask > 0] = (0, 255, 0)
             vx = vz = 0.0
-            if det:
-                last_seen = now
-                last_ex = (det[0] - PROC_W / 2.0) / (PROC_W / 2.0)
-                if following:
-                    vx, vz = compute_cmd(det, PROC_W, target, max_fwd, max_turn)
-                    if not was_visible:
-                        self.drive.beep()
-                status = "follow" if following else "idle"
-            elif not following:
+            note = ""
+            if not following:
                 status = "idle"
-                last_seen = now                       # so pressing GO with no toy in view starts a search
-            elif self.search and last_seen:
-                vz, status = search_cmd(now - last_seen, last_ex)
+                rec.idle(now)                         # pressing GO with no toy in view starts a scan
+            elif det:
+                vx, vz = compute_cmd(det, PROC_W, PROC_H, target, max_fwd, max_turn)
+                rec.seen(now, det, PROC_W, PROC_H, target, vz_s)
+                status = "follow"
+                if not was_visible:
+                    self.drive.beep()
+            elif self.search:
+                vx, vz, status, note = rec.cmd(now)
                 vz = clamp(vz, -max_turn, max_turn)
             else:
-                status = "follow" if now - last_seen < LOST_GRACE_S else "lost"
+                status = "follow" if now - rec.t < LOST_GRACE_S else "lost"
+            if (status, note) != shown:               # one terminal line per change, for debugging
+                shown = (status, note)
+                print("[follow_bot] %s %s" % (status, note), flush=True)
             was_visible = det is not None
 
             # Ease into motion, but stop instantly.
@@ -404,7 +473,7 @@ class FollowBot(object):
                 vx_s = vz_s = 0.0
             self.drive.light(status)
 
-            self._draw(frame, det, status, following)
+            self._draw(frame, det, (status + " " + note).strip(), following)
             ok, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self.lock:
@@ -473,7 +542,7 @@ PAGE = """<!doctype html>
 <small id="batt"></small>
 <script>
 const words = {idle:"Press GO and show me the toy!", follow:"I see it! Following...",
-               search:"Where did it go? Looking...", lost:"I can't find it. Show me the toy!",
+               search:"Where did it go? Looking...", backup:"Oops, too close! Backing up...", lost:"I can't find it. Show me the toy!",
                "no camera":"My camera is not working."};
 function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show); }
 function show(s){
