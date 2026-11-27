@@ -69,3 +69,6 @@ yarn-error.log*
 .config/
 .local/
 
+
+# Logs and camera frames pulled from the robot by tools/pi.sh
+pi_reports/

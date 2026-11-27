@@ -1,0 +1,56 @@
+#!/bin/bash
+# Helper for working on the robot from the Mac. Run from anywhere:
+#
+#   tools/pi.sh deploy   copy follow_bot.py to the robot
+#   tools/pi.sh run      deploy, then run the follow bot; its log is saved in pi_reports/follow.log
+#   tools/pi.sh snap     save a camera frame from the running follow bot to pi_reports/
+#   tools/pi.sh diag     collect hardware info from the robot into pi_reports/diag.txt
+#
+# Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
+# Set PI=pi@<ip> if yahboom.local does not resolve.
+# Tip: run  ssh-copy-id pi@yahboom.local  once so it stops asking for the password.
+
+PI="${PI:-pi@yahboom.local}"
+REMOTE_DIR="/home/pi/Rosmaster/rosmaster"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$REPO/pi_reports"
+mkdir -p "$OUT"
+
+deploy() {
+    scp -q "$REPO/rosmaster/follow_bot.py" "$PI:$REMOTE_DIR/" && echo "Copied follow_bot.py to $PI"
+}
+
+case "$1" in
+deploy)
+    deploy
+    ;;
+run)
+    shift
+    deploy || exit 1
+    echo "Running on the robot. Ctrl+C here stops it (and the wheels). Log: pi_reports/follow.log"
+    # -tt so Ctrl+C reaches the robot and follow_bot.py can stop the motors cleanly.
+    ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; python3 -u follow_bot.py $*" 2>&1 | tee "$OUT/follow.log"
+    ;;
+snap)
+    f="$OUT/snap-$(date +%H%M%S).jpg"
+    curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
+    ;;
+diag)
+    ssh "$PI" 'bash -s' > "$OUT/diag.txt" 2>&1 <<'REMOTE'
+echo "== serial devices"; ls -l /dev/serial/by-id/ /dev/myserial /dev/rplidar /dev/ydlidar /dev/ttyUSB* /dev/ttyACM* /dev/ttyAMA* 2>&1
+echo "== lsusb"; lsusb
+echo "== udev rules"; ls /etc/udev/rules.d/; grep -h -iE "lidar|serial|ttyUSB" /etc/udev/rules.d/* 2>/dev/null
+LIB=$(python3 -c "import Rosmaster_Lib; print(Rosmaster_Lib.__file__)" 2>&1)
+echo "== Rosmaster_Lib: $LIB"; grep -n "com=" "$LIB" | head -5
+echo "== Rosmaster_Lib lidar functions"; grep -n "def " "$LIB" | grep -iE "lidar|laser|scan" || echo "(none)"
+echo "== python"; python3 --version; python3 -c "import cv2; print('cv2', cv2.__version__, cv2.__file__)" 2>&1
+echo "== lidar-related files in home"; ls ~ ; find ~ -maxdepth 4 -iname "*lidar*" 2>/dev/null | head -20
+echo "== recent tty kernel messages"; dmesg 2>/dev/null | grep -iE "tty|cp210|ch34" | tail -15
+echo "== system"; uname -a; cat /etc/os-release | head -3
+REMOTE
+    echo "Saved pi_reports/diag.txt"
+    ;;
+*)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
