@@ -10,6 +10,7 @@
 #                          so give it 50 cm of clear floor all round. Saved in pi_reports/calibrate.txt
 #   tools/pi.sh depth-setup  build Orbbec's depth-camera SDK on the robot and test it (10+ minutes,
 #                          needs internet on the robot). Log in pi_reports/depth_setup.txt
+#   tools/pi.sh health   check the robot's SD card for corrupted system files (several minutes)
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
 # Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
@@ -45,6 +46,16 @@ run)
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
+    ;;
+health)
+    # Looks for a failing SD card / power problems: corrupted system files, disk and voltage errors.
+    ssh -tt "$PI" 'echo "== power/throttle (0x0 is good)"; vcgencmd get_throttled; vcgencmd measure_temp
+echo "== disk"; df -h / | tail -1; mount | grep " / "
+echo "== kernel errors"; sudo dmesg | grep -iE "mmc|ext4|i/o error|under-?voltage|segfault" | tail -25
+echo "== corrupted packaged files (this takes several minutes)"
+dpkg -s debsums >/dev/null 2>&1 || sudo apt-get install -y -qq debsums
+sudo debsums -s 2>&1 | head -200; echo "== done"' 2>&1 | tee "$OUT/health.txt"
+    echo "Saved pi_reports/health.txt"
     ;;
 depth-setup)
     scp -q "$REPO/tools/depth_setup.sh" "$REPO/tools/depth_test.py" "$PI:/tmp/" || exit 1
@@ -90,6 +101,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
