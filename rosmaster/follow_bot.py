@@ -38,12 +38,14 @@ PROC_W, PROC_H = 640, 480     # processing size. Full resolution so small/far to
 
 # Preset colours, OpenCV HSV (H 0-179). Each is a list of (low, high) ranges.
 COLORS = {
-    "red":    [((0, 120, 70), (9, 255, 255)), ((170, 120, 70), (179, 255, 255))],
+    "red":    [((0, 130, 110), (9, 255, 255)), ((170, 130, 110), (179, 255, 255))],
     "orange": [((8, 130, 100), (21, 255, 255))],
     "yellow": [((22, 100, 100), (34, 255, 255))],
     "green":  [((40, 80, 60), (85, 255, 255))],
     "blue":   [((95, 120, 60), (125, 255, 255))],
-    "pink":   [((135, 55, 80), (176, 255, 255))],
+    # Pink runs from magenta round to coral (which wraps past red). It needs the
+    # high saturation/brightness floor: dark red-brown furniture has the same hue.
+    "pink":   [((140, 90, 110), (179, 255, 255))],
 }
 
 # Speed presets: (max forward m/s, max turn rad/s)
@@ -54,7 +56,9 @@ SPEEDS = {
 
 MAX_REVERSE = 0.10      # m/s. Backing up is blind, keep it gentle.
 MIN_AREA_PX = 40        # ignore blobs smaller than this many pixels (about 7 px across)
-MIN_FILL = 0.30         # blob area / enclosing-circle area; rejects thin streaks
+MIN_FILL = 0.40         # blob area / enclosing-circle area. A ball is ~0.8; streaks and
+                        # ragged patches of furniture are ~0.1-0.3
+MIN_FILL_EDGE = 0.20    # looser for a blob cut off by the edge of the picture
 TURN_GAIN = 2.0         # rad/s per unit of horizontal error (-1..1)
 DRIVE_GAIN = 0.45       # m/s per unit of relative size error
 TURN_DEADBAND = 0.08    # fraction of half-frame
@@ -105,6 +109,7 @@ def detect(frame, ranges, prev=None):
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, _K_CLOSE)   # fill shiny highlights
     found = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     contours = found[0] if len(found) == 2 else found[1]   # OpenCV 3 vs 4
+    h, w = mask.shape
     best, best_score = None, 0.0
     for c in contours:
         area = cv.contourArea(c)
@@ -112,9 +117,15 @@ def detect(frame, ranges, prev=None):
             continue
         (x, y), r = cv.minEnclosingCircle(c)
         fill = area / (math.pi * r * r + 1e-6)
-        if fill < MIN_FILL:
+        bx, by, bw, bh = cv.boundingRect(c)
+        on_edge = bx <= 1 or by <= 1 or bx + bw >= w - 1 or by + bh >= h - 1
+        if fill < (MIN_FILL_EDGE if on_edge else MIN_FILL):
             continue
-        score = area * (0.5 + fill)
+        # How vivid is it? Toys are far more saturated than look-alike furniture.
+        one = np.zeros((bh, bw), np.uint8)
+        cv.drawContours(one, [c], -1, 255, -1, offset=(-bx, -by))
+        sat = cv.mean(hsv[by:by + bh, bx:bx + bw], mask=one)[1] / 255.0
+        score = area * fill * fill * sat * sat
         if prev is not None and math.hypot(x - prev[0], y - prev[1]) < max(80.0, 4 * r):
             score *= 2.0
         if score > best_score:
@@ -138,13 +149,15 @@ def learn_color(frame):
         return None, "Too dull. Hold something bright right inside the box!"
     # Hue is circular (red wraps 179 -> 0). Histogram it and take the main peak.
     hist = np.bincount(vivid[:, 0].astype(int), minlength=180).astype(np.float32)
-    hist = np.convolve(np.concatenate([hist[-8:], hist, hist[:8]]), np.ones(17), "valid")
+    hist = np.convolve(np.concatenate([hist[-4:], hist, hist[:4]]), np.ones(9), "valid")
     h_mid = int(np.argmax(hist))
     dh = np.abs(((vivid[:, 0] - h_mid + 90) % 180) - 90)
-    core = vivid[dh <= 12]
-    tol = int(clamp(np.percentile(dh[dh <= 12], 95) + 6, 9, 16))
-    s_lo = int(max(40, np.percentile(core[:, 1], 5) - 35))
-    v_lo = int(max(40, np.percentile(core[:, 2], 5) - 45))
+    core = vivid[dh <= 8]
+    tol = int(clamp(np.percentile(dh[dh <= 8], 90) + 4, 6, 10))
+    # Floors relative to the toy itself: a vivid toy gets a strict floor that
+    # shuts out dull things of the same hue; a pastel toy gets a looser one.
+    s_lo = int(max(60, 0.6 * np.median(core[:, 1])))
+    v_lo = int(max(60, 0.45 * np.median(core[:, 2])))
     lo, hi = h_mid - tol, h_mid + tol
     if lo < 0:
         ranges = [((0, s_lo, v_lo), (hi, 255, 255)), ((180 + lo, s_lo, v_lo), (179, 255, 255))]
