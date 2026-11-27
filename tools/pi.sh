@@ -34,7 +34,9 @@ run)
     ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && echo "Stopped a follow bot that was already running" && sleep 2'
     echo "Running on the robot. Ctrl+C here stops it (and the wheels). Log: pi_reports/follow.log"
     # -tt so Ctrl+C reaches the robot and follow_bot.py can stop the motors cleanly.
-    ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; python3 -u follow_bot.py $*" 2>&1 | tee "$OUT/follow.log"
+    ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; rm -rf /tmp/follow_frames; python3 -u follow_bot.py --save-frames /tmp/follow_frames $*" 2>&1 | tee "$OUT/follow.log"
+    # Bring back the pictures of whatever it took for the toy during this run.
+    mkdir -p "$OUT/frames" && scp -q "$PI:/tmp/follow_frames/*.jpg" "$OUT/frames/" 2>/dev/null && echo "Saved pictures to pi_reports/frames/"
     ;;
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
