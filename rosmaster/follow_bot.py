@@ -60,8 +60,13 @@ DRIVE_GAIN = 0.45       # m/s per unit of relative size error
 TURN_DEADBAND = 0.08    # fraction of half-frame
 DRIVE_DEADBAND = 0.12   # relative size error
 LOST_GRACE_S = 0.5      # coast-free pause before deciding the target is gone
-SEARCH_S = 3.0          # spin slowly toward where it was last seen, then stop
-SEARCH_TURN = 0.7       # rad/s
+# Searching for a lost toy: turn a bit, stop and look, turn a bit more...
+SCAN_TURN = 0.9         # rad/s while turning
+SCAN_STEP_S = 0.7       # turn this long (about 35 degrees, less than the camera's view)
+SCAN_LOOK_S = 0.4       # then hold still this long so the picture isn't blurred
+SCAN_SWEEP_S = 13.0     # one sweep = a bit more than a full circle
+SCAN_REST_S = 4.0       # rest between sweeps; next sweep goes the other way
+SCAN_GIVE_UP_S = 60.0   # then wait quietly until the toy shows up again
 LEARN_BOX = 0.12        # centre box (fraction of frame height) for "Learn colour"
 
 
@@ -158,6 +163,23 @@ def compute_cmd(det, frame_w, target_size, max_fwd, max_turn):
     if vx > 0:
         vx *= max(0.0, 1.0 - abs(ex))                   # face it first, then drive
     return vx, vz
+
+
+def search_cmd(t_lost, last_ex):
+    """What to do t_lost seconds after the toy vanished. Returns (vz, status).
+
+    Starts turning toward the side where the toy was last seen.
+    """
+    t = t_lost - LOST_GRACE_S
+    if t < 0:
+        return 0.0, "follow"
+    if t > SCAN_GIVE_UP_S:
+        return 0.0, "lost"
+    sweep, tc = divmod(t, SCAN_SWEEP_S + SCAN_REST_S)
+    if tc >= SCAN_SWEEP_S or (tc % (SCAN_STEP_S + SCAN_LOOK_S)) >= SCAN_STEP_S:
+        return 0.0, "search"                               # resting or looking
+    direction = -math.copysign(1.0, last_ex) * (1.0 if int(sweep) % 2 == 0 else -1.0)
+    return direction * SCAN_TURN, "search"
 
 
 class Drive(object):
@@ -353,13 +375,12 @@ class FollowBot(object):
                 status = "follow" if following else "idle"
             elif not following:
                 status = "idle"
-            elif now - last_seen < LOST_GRACE_S:
-                status = "follow"
-            elif self.search and last_seen and now - last_seen < SEARCH_S:
-                vz = -math.copysign(SEARCH_TURN, last_ex)
-                status = "search"
+                last_seen = now                       # so pressing GO with no toy in view starts a search
+            elif self.search and last_seen:
+                vz, status = search_cmd(now - last_seen, last_ex)
+                vz = clamp(vz, -max_turn, max_turn)
             else:
-                status = "lost"
+                status = "follow" if now - last_seen < LOST_GRACE_S else "lost"
             was_visible = det is not None
 
             # Ease into motion, but stop instantly.
@@ -452,7 +473,7 @@ PAGE = """<!doctype html>
 <small id="batt"></small>
 <script>
 const words = {idle:"Press GO and show me the toy!", follow:"I see it! Following...",
-               search:"Where did it go? Looking...", lost:"I lost it. Show me again!",
+               search:"Where did it go? Looking...", lost:"I can't find it. Show me the toy!",
                "no camera":"My camera is not working."};
 function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show); }
 function show(s){
@@ -553,7 +574,7 @@ def main():
     ap.add_argument("--port", type=int, default=6501)
     ap.add_argument("--no-motors", action="store_true", help="vision only; never move the wheels")
     ap.add_argument("--invert-turn", action="store_true", help="use if the robot turns AWAY from the toy")
-    ap.add_argument("--no-search", action="store_true", help="don't spin to look for a lost toy")
+    ap.add_argument("--no-search", action="store_true", help="don't turn around looking for a lost toy")
     ap.add_argument("--target-size", type=float, default=0.10,
                     help="how big the toy should look, as a fraction of picture width (bigger = closer)")
     ap.add_argument("--debug", action="store_true")
