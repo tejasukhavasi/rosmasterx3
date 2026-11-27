@@ -11,6 +11,8 @@
 #   tools/pi.sh depth-setup  build Orbbec's depth-camera SDK on the robot and test it (10+ minutes,
 #                          needs internet on the robot). Log in pi_reports/depth_setup.txt
 #   tools/pi.sh backup   copy the robot's own files (Yahboom app, motor library, device rules) to pi_backup/
+#   tools/pi.sh repair   step 1 of the SD-card repair: report the damage, schedule a disk check, reboot
+#   tools/pi.sh repair2  step 2, after the reboot: fix the package database and the compiler
 #   tools/pi.sh health   check the robot's SD card for corrupted system files (several minutes)
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
@@ -58,6 +60,13 @@ backup)
         echo "--- tar errors:" >&2; cat /tmp/backup_errors.txt >&2' > "$B/robot-files.tgz"
     ssh "$PI" 'pip list 2>/dev/null; echo ---; dpkg --get-selections 2>&1 | head -3000; echo ---; ls -la ~ ; du -sh ~/* 2>/dev/null' > "$B/inventory.txt"
     ls -lh "$B"; echo "Files in archive: $(tar tzf "$B/robot-files.tgz" | wc -l)"
+    ;;
+repair|repair2)
+    n=1; [ "$1" = "repair2" ] && n=2
+    scp -q "$REPO/tools/pi_repair.sh" "$PI:/tmp/" || exit 1
+    ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
+    ssh -tt "$PI" "bash /tmp/pi_repair.sh $n" 2>&1 | tee "$OUT/repair$n.txt"
+    echo "Saved pi_reports/repair$n.txt"
     ;;
 health)
     # Looks for a failing SD card / power problems: corrupted system files, disk and voltage errors.
@@ -113,6 +122,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
