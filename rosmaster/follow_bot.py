@@ -59,6 +59,8 @@ TURN_GAIN = 2.0         # rad/s per unit of horizontal error (-1..1)
 DRIVE_GAIN = 0.45       # m/s per unit of relative size error
 TURN_DEADBAND = 0.08    # fraction of half-frame
 DRIVE_DEADBAND = 0.12   # relative size error
+CONFIRM_FRAMES = 3      # a toy must be seen this many frames in a row before it counts,
+                        # so a one-frame flicker of something pink-ish can't interrupt a search
 LOST_GRACE_S = 0.4      # coast-free pause before deciding the target is gone
 # The camera can't see the floor right in front of the robot, so a toy low in
 # the picture is about to disappear underneath it.
@@ -389,7 +391,7 @@ class FollowBot(object):
 
     def _loop(self):
         rec = Recovery()
-        was_visible, prev, shown = False, None, None
+        was_visible, prev, shown, streak = False, None, None, 0
         vx_s, vz_s = 0.0, 0.0
         fails = 0
         while self.running:
@@ -431,6 +433,10 @@ class FollowBot(object):
             frame = frame.copy()                      # keep self.raw free of drawings
             if show_mask:
                 frame[mask > 0] = (0, 255, 0)
+            streak = streak + 1 if det else 0
+            blip = det if (det and not was_visible and streak < CONFIRM_FRAMES) else None
+            if blip:
+                det = None                            # not convinced yet; carry on as if unseen
             vx = vz = 0.0
             note = ""
             if not following:
@@ -442,6 +448,7 @@ class FollowBot(object):
                 status = "follow"
                 if not was_visible:
                     self.drive.beep()
+                    print("[follow_bot] saw toy at x=%d y=%d, %d px wide" % det, flush=True)
             elif self.search:
                 vx, vz, status, note = rec.cmd(now)
                 vz = clamp(vz, -max_turn, max_turn)
@@ -473,7 +480,7 @@ class FollowBot(object):
                 vx_s = vz_s = 0.0
             self.drive.light(status)
 
-            self._draw(frame, det, (status + " " + note).strip(), following)
+            self._draw(frame, det or blip, (status + " " + note).strip(), following)
             ok, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self.lock:
