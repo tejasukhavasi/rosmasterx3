@@ -538,6 +538,8 @@ class FollowBot(object):
             self._draw(frame, det or blip, (status + " " + note).strip(), following)
             if self.lidar is not None:
                 self._draw_radar(frame)
+            if hasattr(self.cam, "depth"):
+                self._draw_depth(frame)
             ok, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self.lock:
@@ -557,6 +559,24 @@ class FollowBot(object):
             print("[follow_bot]   saved %s" % name, flush=True)
         except Exception:
             pass
+
+    def _draw_depth(self, frame, w=160, h=120):
+        """Small depth picture in the bottom-right corner: near = red, far = blue,
+        black = no reading. The number is the nearest thing straight ahead."""
+        depth = self.cam.depth()
+        x0, y0 = frame.shape[1] - w - 8, frame.shape[0] - h - 8
+        if depth is None:
+            cv.putText(frame, "no depth", (x0 + 30, y0 + h // 2), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            return
+        small = cv.resize(depth, (w, h), interpolation=cv.INTER_NEAREST)
+        img = cv.applyColorMap(255 - np.clip(small / 4000.0 * 255, 0, 255).astype(np.uint8), cv.COLORMAP_JET)
+        img[small == 0] = 0
+        frame[y0:y0 + h, x0:x0 + w] = img
+        cv.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (255, 255, 255), 1)
+        from orbbec_camera import depth_ahead
+        ahead = depth_ahead(depth)
+        cv.putText(frame, "ahead %.2f m" % ahead if ahead else "ahead ?", (x0 + 4, y0 + 14),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     def _draw_radar(self, frame, size=150):
         """Top-down view of the lidar points in the corner of the video.
@@ -777,15 +797,32 @@ def make_app(fb):
 
 
 def open_camera(which, debug):
+    """auto: Orbbec SDK (colour + depth) if it is installed, otherwise OpenCV.
+    opencv / usb / <number>: plain OpenCV capture, as rosmaster_main.py does."""
+    if which == "auto":
+        try:
+            import orbbec_camera
+            if orbbec_camera.sdk_available():
+                cam = orbbec_camera.OrbbecCamera(debug=debug)
+                if cam.isOpened():
+                    print("[follow_bot] camera: Orbbec SDK, colour + %s"
+                          % ("depth lined up with colour" if cam.aligned else
+                             "depth (not lined up)" if cam.with_depth else "no depth"), flush=True)
+                    return cam
+                print("[follow_bot] Orbbec SDK camera failed (%s); trying OpenCV" % cam.error, flush=True)
+        except Exception as e:
+            print("[follow_bot] Orbbec SDK not usable (%s); trying OpenCV" % e, flush=True)
     from camera_rosmaster import Rosmaster_Camera
-    ids = {"depth": 0x50, "usb": 0x51}
+    ids = {"auto": 0x50, "opencv": 0x50, "depth": 0x50, "usb": 0x51}
     vid = ids[which] if which in ids else int(which)
+    print("[follow_bot] camera: OpenCV", flush=True)
     return Rosmaster_Camera(video_id=vid, debug=debug)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Rosmaster X3 colour follow bot")
-    ap.add_argument("--camera", default="depth", help="depth (default), usb, or a /dev/video index")
+    ap.add_argument("--camera", default="auto",
+                    help="auto (default: Orbbec SDK if installed, else OpenCV), opencv, usb, or a /dev/video index")
     ap.add_argument("--port", type=int, default=6501)
     ap.add_argument("--no-motors", action="store_true", help="vision only; never move the wheels")
     ap.add_argument("--invert-turn", action="store_true", help="use if the robot turns AWAY from the toy")
@@ -830,6 +867,8 @@ def main():
         drive.shutdown()
         if lidar is not None:
             lidar.stop()
+        if hasattr(cam, "close"):
+            cam.close()
 
     atexit.register(shutdown)
     signal.signal(signal.SIGTERM, lambda *_: (shutdown(), exit(0)))
