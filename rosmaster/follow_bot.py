@@ -105,6 +105,7 @@ DEPTH_MAX_WIDTH_M = 1.6 # a "blob" wider than this is a wall, not a target
 FOCAL_PX = 600.0        # camera focal length in pixels at 640 wide (measured from the ball: ~630)
 MOTION_MM = 300         # something this much nearer than a moment ago counts as "walked in"
 MOTION_MIN_AREA = 500   # half-resolution pixels
+NEAREST_MIN_AREA = 700  # half-resolution pixels for "the nearest thing in front of me"
 LEARN_BOX = 0.12        # centre box (fraction of frame height) for "Learn colour"
 
 
@@ -248,11 +249,19 @@ class DepthTarget(object):
         d = depth[::2, ::2]
         h, w = d.shape
         x, y = int(clamp(x / 2, 0, w - 1)), int(clamp(y / 2, 0, h - 1))
-        win = d[max(0, y - 8):y + 9, max(0, x - 8):x + 9]
+        # A finger is not precise: take the NEAREST thing within a generous circle
+        # of the tap, so a tap beside someone's leg still means the leg, not the wall behind.
+        win = d[max(0, y - 30):y + 31, max(0, x - 30):x + 31]
         v = win[win > 0]
-        if v.size < 20:
+        if v.size < 30:
             return False
-        self.z, self.cx, self.cy = float(np.median(v)), float(x), float(y)
+        v = np.sort(v)
+        # nearest distance at which a real patch (40+ pixels within 30 cm) sits
+        ahead = np.searchsorted(v, v + 300, side="right") - np.arange(v.size)
+        solid = np.nonzero(ahead >= 40)[0]
+        if solid.size == 0 or v[solid[0]] > 4500:
+            return False
+        self.z, self.cx, self.cy = float(v[solid[0]]) + 100.0, float(x), float(y)
         self.box = (0, 0, w, h)                       # first look: anywhere, nearest to the tap wins
         self.label = label
         self.locked = self._find(d, grow=False)
@@ -352,6 +361,26 @@ def motion_blob(depth, ref):
     k = len(xs) // 2                                    # a pixel that really is on the blob
     order = np.argsort(xs)
     return float(xs[order[k]] * 2), float(ys[order[k]] * 2)
+
+
+def nearest_blob(depth):
+    """A pixel on the nearest sizeable thing in the middle of the view (0.6-3 m), or None.
+    Used for "stand in front of me and press GO"."""
+    d = depth[::2, ::2]
+    h, w = d.shape
+    mid = d[:, int(w * 0.15):int(w * 0.85)]
+    near = mid[(mid > 600) & (mid < 3000)]
+    if near.size < NEAREST_MIN_AREA:
+        return None
+    hist = np.bincount((near // 100).astype(np.int64), minlength=31)
+    run = hist[:-2] + hist[1:-1] + hist[2:]            # pixels within a 30 cm thick layer
+    layers = np.nonzero(run >= NEAREST_MIN_AREA)[0]
+    if len(layers) == 0:
+        return None
+    z0 = layers[0] * 100
+    ys, xs = np.nonzero((mid >= z0) & (mid < z0 + 300))
+    k = np.argsort(xs)[len(xs) // 2]
+    return float((xs[k] + int(w * 0.15)) * 2), float(ys[k] * 2)
 
 
 def depth_cmd(cx, dist, frame_w, target_dist, max_fwd, max_turn):
@@ -622,6 +651,7 @@ class FollowBot(object):
         still_since = None       # when the robot last came to rest
         ref, ref_t = None, 0.0   # depth picture to compare against for "something walked in"
         det_seq = -1
+        want_nearest, go_t = True, 0.0   # shape mode: on GO, pick up the nearest thing in front
         while self.running:
             ok, raw = self.cam.get_frame()
             if not ok:
@@ -655,16 +685,21 @@ class FollowBot(object):
                 tap, self._tap = self._tap, None
                 if tap is not None:
                     # Tap = "follow this". By shape if the depth camera can see it, else by its colour.
-                    if depth is not None and self.target.start_at(depth, tap[0], tap[1]):
-                        self.mode, self.message = "shape", "OK! Following that (%.1f m away)." % self.target.dist
-                        last_ok = time.time()
+                    if self.mode == "shape":
+                        if depth is not None and self.target.start_at(depth, tap[0], tap[1]):
+                            self.message = "OK! Following that (%.1f m away)." % self.target.dist
+                            last_ok = time.time()
+                            print("[follow_bot] tap locked on at %.2f m" % self.target.dist, flush=True)
+                        else:
+                            self.message = "I can't lock onto that. It needs to be 0.6 to 4 m away. For a small toy, use a colour button."
+                            print("[follow_bot] tap at x=%d y=%d found nothing to lock onto" % tap, flush=True)
                     else:
                         ranges, msg = learn_color(frame, at=tap)
                         if ranges:
-                            self.ranges, self.color_name, self.mode = ranges, "learned", "colour"
+                            self.ranges, self.color_name = ranges, "learned"
                             self.message = "OK! Following that colour."
                         else:
-                            self.message = "I can't make that out. Tap something closer or more colourful."
+                            self.message = "That spot is too dull to follow by colour."
                 following, ranges, show_mask = self.following, self.ranges, self.show_mask
                 mode = self.mode
                 self.raw = frame
@@ -699,6 +734,11 @@ class FollowBot(object):
                         near = sorted([n for n in near if n[0] is not None and n[0] < 4.5], key=lambda n: n[0])
                         if near and tgt.start_box(depth, near[0][1]["box"], "person"):
                             found, last_ok = True, now
+                    if not tgt.locked and want_nearest and still_since is not None and now - go_t > 0.3:
+                        want_nearest = False              # once per GO: whatever stands in front of me
+                        spot = nearest_blob(depth)
+                        if spot and tgt.start_at(depth, spot[0], spot[1], "thing in front"):
+                            found, last_ok = True, now
                     if not tgt.locked and still_since is not None and now - still_since > 0.7:
                         if ref is None or now - ref_t > 3.0:
                             ref, ref_t = depth, now       # fresh "before" picture
@@ -713,6 +753,7 @@ class FollowBot(object):
                 if not following:
                     status = "idle"
                     rec.idle(now)
+                    want_nearest, go_t = True, now
                 elif found:
                     cx, cy = tgt.center
                     x1, y1, x2, y2 = tgt.rect
@@ -725,8 +766,8 @@ class FollowBot(object):
                         self._save_frame(frame, det, now)
                 elif tgt.locked:
                     status = "follow"                 # missed a frame or two; hold still
-                elif self.search and (rec._have or self.detector is not None):
-                    # Lost it, or GO with nobody in view and a person finder to look with: turn and look.
+                elif self.search and rec._have:
+                    # Lost what it was following: turn and look (the person finder picks people up again).
                     vx, vz, status, note = rec.cmd(now)
                 else:
                     status = "waiting"
