@@ -40,14 +40,15 @@ PROC_W, PROC_H = 640, 480     # processing size. Full resolution so small/far to
 
 # Preset colours, OpenCV HSV (H 0-179). Each is a list of (low, high) ranges.
 COLORS = {
-    "red":    [((0, 130, 110), (9, 255, 255)), ((170, 130, 110), (179, 255, 255))],
+    "red":    [((0, 135, 95), (9, 255, 255)), ((170, 135, 95), (179, 255, 255))],
     "orange": [((8, 130, 100), (21, 255, 255))],
     "yellow": [((22, 100, 100), (34, 255, 255))],
     "green":  [((40, 80, 60), (85, 255, 255))],
     "blue":   [((95, 120, 60), (125, 255, 255))],
-    # Pink runs from magenta round to coral (which wraps past red). It needs the
-    # high saturation/brightness floor: dark red-brown furniture has the same hue.
-    "pink":   [((140, 90, 110), (179, 255, 255))],
+    # Pink runs from magenta round to coral. Skin, leather and red-brown wood all
+    # share this hue; what sets a toy apart is how much more saturated it is
+    # (measured on the robot: ball about 140-180, skin and leather about 80-115).
+    "pink":   [((140, 120, 95), (179, 255, 255))],
 }
 
 # Speed presets: (max forward m/s, max turn rad/s)
@@ -60,6 +61,8 @@ MAX_REVERSE = 0.10      # m/s. Backing up is blind, keep it gentle.
 MIN_AREA_PX = 40        # ignore blobs smaller than this many pixels (about 7 px across)
 MIN_FILL = 0.40         # blob area / enclosing-circle area. A ball is ~0.8; streaks and
                         # ragged patches of furniture are ~0.1-0.3
+MIN_SAT_MARGIN = 15     # a blob's average saturation must beat the colour's floor by this
+                        # much; a patch that only just scrapes over the floor is not the toy
 MIN_FILL_EDGE = 0.20    # looser for a blob cut off by the edge of the picture
 TURN_GAIN = 2.0         # rad/s per unit of horizontal error (-1..1)
 DRIVE_GAIN = 0.45       # m/s per unit of relative size error
@@ -75,19 +78,21 @@ CLIP_EDGE = 0.985       # toy cut off by the bottom of the picture: back away
 # When the toy vanishes while close (or out of the top), back up to widen the view.
 BACKUP_SPEED = 0.08     # m/s
 BACKUP_S = 2.0          # at most this long (about 16 cm)
-# Lidar guard (only with --lidar-front). Distances are measured from the lidar,
+# Lidar: used automatically when /dev/rplidar is present (--no-lidar turns it off).
+LIDAR_FRONT_DEG = 349.0  # lidar angle that points straight ahead (from tools/pi.sh calibrate)
+RADAR_RANGE = 3.0        # m shown in the top-down lidar view on the video
+# Lidar guard. Distances are measured from the lidar,
 # which sits in the middle of the robot, so they include half the robot's length.
 LIDAR_STOP = 0.40       # m. Something this close in the robot's lane: don't move that way
 LIDAR_SLOW = 0.80       # m. Start slowing down from here
 HALF_FOV = 0.55         # rad, roughly half the camera's horizontal field of view
 PREDICT_S = 0.6         # how far ahead to extrapolate the toy's sideways motion
-# Searching for a lost toy: turn a bit, stop and look, turn a bit more...
-SCAN_TURN = 0.9         # rad/s while turning
-SCAN_STEP_S = 0.7       # turn this long (about 35 degrees, less than the camera's view)
-SCAN_LOOK_S = 0.4       # then hold still this long so the picture isn't blurred
-SCAN_SWEEP_S = 13.0     # one sweep = a bit more than a full circle
-SCAN_REST_S = 4.0       # rest between sweeps; next sweep goes the other way
-SCAN_GIVE_UP_S = 60.0   # then wait quietly until the toy shows up again
+# Searching for a lost toy: spin on the spot, pausing the moment something
+# toy-coloured shows up so it can be checked without motion blur.
+SCAN_TURN = 1.5         # rad/s (about 85 degrees a second), whatever the speed setting
+SCAN_SWEEP_S = 5.0      # one sweep = a bit more than a full circle
+SCAN_REST_S = 1.0       # short rest; the next sweep goes the other way
+SCAN_GIVE_UP_S = 30.0   # then wait quietly until the toy shows up again
 LEARN_BOX = 0.12        # centre box (fraction of frame height) for "Learn colour"
 
 
@@ -116,6 +121,7 @@ def detect(frame, ranges, prev=None):
     found = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     contours = found[0] if len(found) == 2 else found[1]   # OpenCV 3 vs 4
     h, w = mask.shape
+    min_sat = (min(lo[1] for lo, _ in ranges) + MIN_SAT_MARGIN) / 255.0
     best, best_score = None, 0.0
     for c in contours:
         area = cv.contourArea(c)
@@ -130,7 +136,9 @@ def detect(frame, ranges, prev=None):
         # How vivid is it? Toys are far more saturated than look-alike furniture.
         one = np.zeros((bh, bw), np.uint8)
         cv.drawContours(one, [c], -1, 255, -1, offset=(-bx, -by))
-        sat = cv.mean(hsv[by:by + bh, bx:bx + bw], mask=one)[1] / 255.0
+        sat = cv.mean(hsv[by:by + bh, bx:bx + bw], mask=cv.bitwise_and(one, mask[by:by + bh, bx:bx + bw]))[1] / 255.0
+        if sat < min_sat:
+            continue
         score = area * fill * fill * sat * sat
         if prev is not None and math.hypot(x - prev[0], y - prev[1]) < max(80.0, 4 * r):
             score *= 2.0
@@ -162,7 +170,7 @@ def learn_color(frame):
     tol = int(clamp(np.percentile(dh[dh <= 8], 90) + 4, 6, 10))
     # Floors relative to the toy itself: a vivid toy gets a strict floor that
     # shuts out dull things of the same hue; a pastel toy gets a looser one.
-    s_lo = int(max(60, 0.6 * np.median(core[:, 1])))
+    s_lo = int(max(60, 0.78 * np.median(core[:, 1])))
     v_lo = int(max(60, 0.45 * np.median(core[:, 2])))
     lo, hi = h_mid - tol, h_mid + tol
     if lo < 0:
@@ -221,15 +229,15 @@ def lidar_guard(vx, front, rear):
 
 
 def scan_cmd(t, direction):
-    """Turn-and-look search, t seconds after it began. Returns (vz, status).
+    """Spin search, t seconds after it began. Returns (vz, status).
 
     direction is +1 to start turning left, -1 to start turning right.
     """
     if t > SCAN_GIVE_UP_S:
         return 0.0, "lost"
     sweep, tc = divmod(t, SCAN_SWEEP_S + SCAN_REST_S)
-    if tc >= SCAN_SWEEP_S or (tc % (SCAN_STEP_S + SCAN_LOOK_S)) >= SCAN_STEP_S:
-        return 0.0, "search"                               # resting or looking
+    if tc >= SCAN_SWEEP_S:
+        return 0.0, "search"                               # resting
     return direction * (1.0 if int(sweep) % 2 == 0 else -1.0) * SCAN_TURN, "search"
 
 
@@ -492,7 +500,8 @@ class FollowBot(object):
                     self._save_frame(frame, det, now)
             elif self.search:
                 vx, vz, status, note = rec.cmd(now)
-                vz = clamp(vz, -max_turn, max_turn)
+                if blip:
+                    vz = 0.0                          # hold still for a proper look
             else:
                 status = "follow" if now - rec.t < LOST_GRACE_S else "lost"
             if self.lidar is not None:
@@ -527,6 +536,8 @@ class FollowBot(object):
             self.drive.light(status)
 
             self._draw(frame, det or blip, (status + " " + note).strip(), following)
+            if self.lidar is not None:
+                self._draw_radar(frame)
             ok, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self.lock:
@@ -546,6 +557,28 @@ class FollowBot(object):
             print("[follow_bot]   saved %s" % name, flush=True)
         except Exception:
             pass
+
+    def _draw_radar(self, frame, size=150):
+        """Top-down view of the lidar points in the corner of the video.
+
+        Robot in the middle facing up; the box ahead/behind is the lane the
+        guard watches; points inside the stop distance are drawn red.
+        """
+        pts = self.lidar.points()
+        x0, y0 = frame.shape[1] - size - 8, 8
+        cx, cy, sc = x0 + size // 2, y0 + size // 2, (size / 2.0) / RADAR_RANGE
+        frame[y0:y0 + size, x0:x0 + size] = frame[y0:y0 + size, x0:x0 + size] // 3
+        cv.rectangle(frame, (x0, y0), (x0 + size, y0 + size), (255, 255, 255), 1)
+        lane, stop = int(0.18 * sc), int(LIDAR_STOP * sc)
+        cv.rectangle(frame, (cx - lane, cy - stop), (cx + lane, cy + stop), (120, 120, 120), 1)
+        for x, y in pts:
+            px, py = int(cx - y * sc), int(cy - x * sc)
+            if x0 < px < x0 + size - 1 and y0 < py < y0 + size - 1:
+                near = abs(y) <= 0.18 and abs(x) <= LIDAR_STOP
+                cv.circle(frame, (px, py), 1, (0, 0, 255) if near else (0, 255, 255), -1)
+        cv.drawMarker(frame, (cx, cy), (255, 255, 255), cv.MARKER_TRIANGLE_UP, 8, 1)
+        if not pts:
+            cv.putText(frame, "no lidar data", (x0 + 8, cy + 30), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     @staticmethod
     def _draw(frame, det, status, following):
@@ -608,6 +641,7 @@ PAGE = """<!doctype html>
   <button id="mask" onclick="post('mask')">&#128064; Show what matches</button>
 </div>
 <small id="batt"></small>
+<p><a href="/lidar" style="color:#9cc3ff">Lidar view</a></p>
 <script>
 const words = {idle:"Press GO and show me the toy!", follow:"I see it! Following...",
                search:"Where did it go? Looking...", backup:"Oops, too close! Backing up...", lost:"I can't find it. Show me the toy!",
@@ -624,6 +658,37 @@ function show(s){
 document.querySelectorAll('#colors [data-c]').forEach(b=>b.onclick=()=>post('color/'+b.dataset.c));
 document.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>post('speed/'+b.dataset.s));
 setInterval(()=>fetch('/api/status').then(r=>r.json()).then(show).catch(()=>{}), 700);
+</script></body></html>
+"""
+
+
+LIDAR_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lidar</title>
+<style>body{margin:0;background:#101623;color:#dfe6f3;font-family:system-ui,sans-serif;text-align:center}
+canvas{width:min(96vw,82vh);height:min(96vw,82vh);background:#0a0e17;border-radius:12px;margin-top:8px}
+p{margin:8px}</style></head><body>
+<p id="info">waiting for the lidar...</p>
+<canvas id="c" width="900" height="900"></canvas>
+<p>Robot in the middle, facing up. Rings every 1 m. Range <select id="r"><option>2</option><option selected>4</option><option>8</option><option>12</option></select> m
+&nbsp; <a href="/" style="color:#8fb8ff">back to Follow Bot</a></p>
+<script>
+const c=document.getElementById('c'),g=c.getContext('2d'),W=c.width;
+function draw(d){
+  const R=+document.getElementById('r').value, sc=W/2/R, m=W/2;
+  g.clearRect(0,0,W,W); g.strokeStyle='#26324a'; g.lineWidth=1;
+  for(let i=1;i<=R;i++){g.beginPath();g.arc(m,m,i*sc,0,7);g.stroke();}
+  g.beginPath();g.moveTo(m,0);g.lineTo(m,W);g.moveTo(0,m);g.lineTo(W,m);g.stroke();
+  g.strokeStyle='#6b7a99';g.strokeRect(m-0.18*sc,m-d.stop*sc,0.36*sc,2*d.stop*sc);
+  for(const [x,y] of d.points){
+    const near=Math.abs(y)<=0.18&&Math.abs(x)<=d.stop;
+    g.fillStyle=near?'#ff5a5a':'#ffe45c'; g.beginPath(); g.arc(m-y*sc,m-x*sc,3,0,7); g.fill();
+  }
+  g.fillStyle='#fff'; g.beginPath(); g.moveTo(m,m-12); g.lineTo(m-8,m+8); g.lineTo(m+8,m+8); g.fill();
+  const f=v=>v==null?'clear':v.toFixed(2)+' m';
+  document.getElementById('info').textContent = d.on ? d.points.length+' points this moment (of 360 directions) | ahead: '+f(d.front)+' | behind: '+f(d.rear) : 'lidar is off';
+}
+setInterval(()=>fetch('/api/lidar').then(r=>r.json()).then(draw).catch(()=>{}),200);
 </script></body></html>
 """
 
@@ -679,6 +744,19 @@ def make_app(fb):
         time.sleep(0.25)               # let the camera loop pick it up
         return jsonify(fb.snapshot())
 
+    @app.route("/api/lidar")
+    def lidar_points():
+        if fb.lidar is None:
+            return jsonify({"on": False, "points": []})
+        front, rear = fb.lidar.clearance()
+        fin = lambda v: None if v is None or v == float("inf") else round(v, 2)
+        return jsonify({"on": True, "front": fin(front), "rear": fin(rear), "stop": LIDAR_STOP,
+                        "points": [[round(x, 3), round(y, 3)] for x, y in fb.lidar.points()]})
+
+    @app.route("/lidar")
+    def lidar_page():
+        return render_template_string(LIDAR_PAGE)
+
     @app.route("/api/mask", methods=["POST"])
     def mask():
         fb.toggle_mask()
@@ -714,9 +792,9 @@ def main():
     ap.add_argument("--no-search", action="store_true", help="don't turn around looking for a lost toy")
     ap.add_argument("--target-size", type=float, default=0.10,
                     help="how big the toy should look, as a fraction of picture width (bigger = closer)")
-    ap.add_argument("--lidar-front", type=float, default=None, metavar="DEG",
-                    help="use the lidar to avoid obstacles; DEG is the lidar angle that points "
-                         "straight ahead of the robot (see lidar.py)")
+    ap.add_argument("--lidar-front", type=float, default=LIDAR_FRONT_DEG, metavar="DEG",
+                    help="lidar angle that points straight ahead of the robot (tools/pi.sh calibrate)")
+    ap.add_argument("--no-lidar", action="store_true", help="ignore the lidar even if it is plugged in")
     ap.add_argument("--lidar-port", default="/dev/rplidar")
     ap.add_argument("--save-frames", default=None, metavar="DIR",
                     help="save a picture to DIR each time something is taken for the toy (last 40 kept)")
@@ -729,7 +807,9 @@ def main():
                          "(bash rosmaster/kill_rosmaster.sh)" % args.camera)
     drive = Drive(enabled=not args.no_motors, invert_turn=args.invert_turn, debug=args.debug)
     lidar = None
-    if args.lidar_front is not None:
+    if args.no_lidar or not os.path.exists(args.lidar_port):
+        print("[follow_bot] lidar off (%s)" % ("--no-lidar" if args.no_lidar else args.lidar_port + " not found"), flush=True)
+    else:
         from lidar import Lidar
         try:
             lidar = Lidar(args.lidar_port, front_deg=args.lidar_front).start()

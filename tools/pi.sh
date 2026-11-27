@@ -8,6 +8,8 @@
 #   tools/pi.sh lidar    identify the lidar on /dev/rplidar into pi_reports/lidar.txt
 #   tools/pi.sh calibrate  find the lidar's forward direction: the robot drives 12 cm forward and back,
 #                          so give it 50 cm of clear floor all round. Saved in pi_reports/calibrate.txt
+#   tools/pi.sh depth-setup  build Orbbec's depth-camera SDK on the robot and test it (10+ minutes,
+#                          needs internet on the robot). Log in pi_reports/depth_setup.txt
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
 # Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
@@ -43,6 +45,12 @@ run)
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
+    ;;
+depth-setup)
+    scp -q "$REPO/tools/depth_setup.sh" "$REPO/tools/depth_test.py" "$PI:/tmp/" || exit 1
+    ssh -tt "$PI" "bash /tmp/depth_setup.sh" 2>&1 | tee "$OUT/depth_setup.txt"
+    scp -q "$PI:/tmp/depth.png" "$OUT/" 2>/dev/null && echo "Saved pi_reports/depth.png"
+    echo "Saved pi_reports/depth_setup.txt"
     ;;
 calibrate)
     deploy || exit 1
@@ -82,6 +90,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
