@@ -105,6 +105,13 @@ DEPTH_MAX_WIDTH_M = 1.6 # a "blob" wider than this is a wall, not a target
 FOCAL_PX = 600.0        # camera focal length in pixels at 640 wide (measured from the ball: ~630)
 MOTION_MM = 300         # something this much nearer than a moment ago counts as "walked in"
 MOTION_MIN_AREA = 500   # half-resolution pixels
+# Telling the target apart from everything else in a busy room.
+TRACK_SIM = 0.40        # while following: colours this unlike the target, several frames running = wrong thing
+REACQ_SIM = 0.62        # after losing it: only take something back if its colours match this well...
+REACQ_MARGIN = 0.05     # ...and clearly better than the runner-up
+NEARBY_SIM = 0.45       # a looser match is enough right after the loss, right where the target was
+GALLERY_MAX = 8         # remembered looks of the target (near/far, front/back)
+JUMP_MM = 120           # neighbouring depth pixels further apart than this belong to different things
 NEAREST_MIN_AREA = 700  # half-resolution pixels for "the nearest thing in front of me"
 LEARN_BOX = 0.12        # centre box (fraction of frame height) for "Learn colour"
 
@@ -226,6 +233,33 @@ def compute_cmd(det, frame_w, frame_h, target_size, max_fwd, max_turn):
     return vx, vz
 
 
+def signature(hsv, mask):
+    """What something looks like, as 16 numbers: how much of it is black / dark grey /
+    light grey / white, and how much is each of 12 hues. hsv and mask are the same size."""
+    px = hsv[mask]
+    if len(px) < 50:
+        return None
+    px = px.astype(np.int32)
+    grey = (px[:, 1] < 45) | (px[:, 2] < 45)
+    h = np.zeros(16, np.float32)
+    h[:4] = np.bincount(np.minimum(px[grey, 2] // 64, 3), minlength=4)
+    h[4:] = np.bincount(px[~grey, 0] * 12 // 180, minlength=12)[:12]
+    return h / len(px)
+
+
+def split_things(d):
+    """Split a (half-resolution) depth picture into separate things: neighbouring
+    pixels belong together unless the distance jumps between them.
+    Returns (label picture, list of (label, x1, y1, x2, y2, area))."""
+    di = d.astype(np.int32)
+    ok = (di > 0) & (di < 4500)
+    ok[:, 1:] &= np.abs(di[:, 1:] - di[:, :-1]) <= JUMP_MM
+    ok[1:, :] &= np.abs(di[1:, :] - di[:-1, :]) <= JUMP_MM
+    n, lab, stats, _ = cv.connectedComponentsWithStats(ok.astype(np.uint8), 4)
+    return lab, [(i, int(stats[i, 0]), int(stats[i, 1]), int(stats[i, 0] + stats[i, 2]), int(stats[i, 1] + stats[i, 3]),
+                  int(stats[i, 4])) for i in range(1, n) if stats[i, 4] >= DEPTH_MIN_AREA]
+
+
 class DepthTarget(object):
     """Follows one thing through the depth picture.
 
@@ -243,6 +277,18 @@ class DepthTarget(object):
         self.cx = self.cy = 0.0
         self.area = 0
         self.label = "thing"
+        self.gallery = []       # remembered looks of this target
+        self.sim = 1.0          # how well the current blob matches them
+        self.width_m = 0.0
+        self.why = ""           # why it was last not found / let go
+        self._blob = None       # (x, y, mask) of the current blob, half-res
+        self._odd = 0
+        self._lost_t = 0.0
+        self._lost_at = (0.0, 0.0)
+
+    def forget(self):
+        """Drop the target completely (a new one will be chosen)."""
+        self.locked, self.gallery, self.width_m, self._odd = False, [], 0.0, 0
 
     def start_at(self, depth, x, y, label="thing"):
         """Lock onto whatever is at pixel (x, y). False if depth has no reading there."""
@@ -263,6 +309,7 @@ class DepthTarget(object):
             return False
         self.z, self.cx, self.cy = float(v[solid[0]]) + 100.0, float(x), float(y)
         self.box = (0, 0, w, h)                       # first look: anywhere, nearest to the tap wins
+        self.forget()
         self.label = label
         self.locked = self._find(d, grow=False)
         return self.locked
@@ -282,6 +329,7 @@ class DepthTarget(object):
             return False
         self.z = float(np.percentile(v, 25))          # the near surface, not the wall seen between the legs
         self.box, self.cx, self.cy = (x1, y1, x2, y2), (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        self.forget()
         self.label = label
         self.locked = self._find(d, grow=False)
         return self.locked
@@ -310,13 +358,86 @@ class DepthTarget(object):
             if best_score is None or score > best_score:
                 best, best_score = i, score
         if not best:
+            self.why = "nothing at that distance where it was"
             return False
         bx, by, bw, bh, area = stats[best]
-        z = float(np.median(roi[lab == best]))
-        if bw * 2 * z / 1000.0 / FOCAL_PX > DEPTH_MAX_WIDTH_M:
-            return False                              # slid onto a wall or big furniture
+        blob = lab == best
+        z = float(np.median(roi[blob]))
+        width = bw * 2 * z / 1000.0 / FOCAL_PX
+        if width > DEPTH_MAX_WIDTH_M:
+            self.why = "it merged with something %.1f m wide (wall or furniture)" % width
+            return False
         self.box = (rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh)
         self.cx, self.cy, self.area, self.z = cents[best][0] + rx1, cents[best][1] + ry1, int(area), z
+        self.width_m = width if not self.width_m else 0.9 * self.width_m + 0.1 * width
+        self._blob = (rx1, ry1, blob)
+        return True
+
+    def observe(self, hsv):
+        """Compare the blob just found with what the target has looked like so far
+        (hsv = half-resolution colour picture). Unlocks if it has clearly become
+        something else. Call after a successful update()."""
+        x, y, blob = self._blob
+        sig = signature(hsv[y:y + blob.shape[0], x:x + blob.shape[1]], blob)
+        if sig is None:
+            return
+        if not self.gallery:
+            self.gallery.append(sig)
+            return
+        self.sim = max(float(np.minimum(sig, g).sum()) for g in self.gallery)
+        if self.sim < TRACK_SIM:
+            self._odd += 1
+            if self._odd >= 6:
+                self.locked, self._odd = False, 0
+                self.why = "what I was following stopped looking like the target (match %.2f)" % self.sim
+        else:
+            self._odd = 0
+            if self.sim < 0.85 and len(self.gallery) < GALLERY_MAX:
+                self.gallery.append(sig)              # a new look of the same target (nearer, turned, ...)
+
+    def let_go(self, now):
+        """Target not found for too long: unlock but remember what it looked like."""
+        self.locked, self._lost_t, self._lost_at = False, now, (self.cx, self.z)
+
+    def reacquire(self, depth, hsv, now):
+        """Look through everything in view for the target that was lost. Only takes
+        something of a believable size whose colours match what the target looked
+        like, and clearly better than anything else in view."""
+        if not self.gallery:
+            return False
+        d = depth[::2, ::2]
+        h, w = d.shape
+        lab, things = split_things(d)
+        scored = []
+        for i, x1, y1, x2, y2, area in things:
+            blob = lab[y1:y2, x1:x2] == i
+            z = float(np.median(d[y1:y2, x1:x2][blob]))
+            wm = (x2 - x1) * 2 * z / 1000.0 / FOCAL_PX
+            hm = (y2 - y1) * 2 * z / 1000.0 / FOCAL_PX
+            cut = y1 <= 2 or y2 >= h - 2 or x1 <= 2 or x2 >= w - 2      # partly out of the picture
+            if wm > 1.0 or wm < 0.10 or hm < (0.20 if cut else 0.40):
+                continue
+            if self.width_m and not (0.4 * self.width_m <= wm <= 2.5 * self.width_m):
+                continue
+            sig = signature(hsv[y1:y2, x1:x2], blob)
+            if sig is None:
+                continue
+            sim = max(float(np.minimum(sig, g).sum()) for g in self.gallery)
+            cx = (x1 + x2) / 2.0
+            nearby = (now - self._lost_t < 1.0 and abs(cx - self._lost_at[0]) < 80
+                      and abs(z - self._lost_at[1]) < 500)
+            scored.append((sim, nearby, (x1, y1, x2, y2), z, blob))
+        if not scored:
+            return False
+        scored.sort(key=lambda c: -c[0])
+        sim, nearby, box, z, blob = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+        if not ((sim >= REACQ_SIM and sim - runner_up >= REACQ_MARGIN) or (nearby and sim >= NEARBY_SIM)):
+            return False
+        ys, xs = np.nonzero(blob)
+        self.box, self.z, self.sim = box, z, sim
+        self.cx, self.cy, self.area = box[0] + float(xs.mean()), box[1] + float(ys.mean()), int(blob.sum())
+        self._blob, self._odd, self.locked = (box[0], box[1], blob), 0, True
         return True
 
     # full-resolution views
@@ -551,7 +672,10 @@ class FollowBot(object):
         self.cam = camera
         self.drive = drive
         self.lidar = lidar
-        self.frames_dir = None          # set to a folder to save a picture each time a toy is spotted
+        self.frames_dir = None          # set to a folder to save debug pictures
+        self._recent = []               # last few (time, colour jpeg, depth png) for the "black box"
+        self._recent_t = 0.0
+        self._event_n = 0
         self._frame_n = 0
         self._frame_t = 0.0
         self.search = search
@@ -686,9 +810,10 @@ class FollowBot(object):
                 if tap is not None:
                     # Tap = "follow this". By shape if the depth camera can see it, else by its colour.
                     if self.mode == "shape":
-                        if depth is not None and self.target.start_at(depth, tap[0], tap[1]):
+                        if depth is not None and self.target.start_at(depth, tap[0], tap[1], "thing you tapped"):
                             self.message = "OK! Following that (%.1f m away)." % self.target.dist
                             last_ok = time.time()
+                            want_nearest = False
                             print("[follow_bot] tap locked on at %.2f m" % self.target.dist, flush=True)
                         else:
                             self.message = "I can't lock onto that. It needs to be 0.6 to 4 m away. For a small toy, use a colour button."
@@ -715,44 +840,66 @@ class FollowBot(object):
 
             if mode == "shape":
                 tgt = self.target
+                hsv = cv.cvtColor(frame[::2, ::2], cv.COLOR_BGR2HSV) if depth is not None else None
                 if self.detector is not None:
                     dets, dets_t, seq = self.detector.results()
                     if now - dets_t < 0.6:
                         people = [d for d in dets if d["cls"] == "person"]
+                self._remember(now, frame, depth)
                 found = tgt.locked and depth is not None and tgt.update(depth)
                 if found:
                     last_ok = now
+                    tgt.observe(hsv)                  # still the same thing? (may unlock)
+                    if not tgt.locked:
+                        found = False
+                        tgt.let_go(now)
+                        print("[follow_bot] let go of the %s: %s" % (tgt.label, tgt.why), flush=True)
+                        self._dump_event("letgo", tgt.why)
                 elif tgt.locked and now - last_ok > LOST_GRACE_S:
-                    tgt.locked = False
-                    print("[follow_bot] lost the %s" % tgt.label, flush=True)
+                    tgt.let_go(now)
+                    print("[follow_bot] lost the %s at %.2f m: %s" % (tgt.label, tgt.dist, tgt.why), flush=True)
+                    self._dump_event("lost", tgt.why)
 
-                # Nothing locked: try to pick a target up.
                 if following and not tgt.locked and depth is not None:
-                    if people and self.detector is not None and seq != det_seq:
-                        det_seq = seq
-                        near = [(box_depth(depth, d["box"]), d) for d in people]
-                        near = sorted([n for n in near if n[0] is not None and n[0] < 4.5], key=lambda n: n[0])
-                        if near and tgt.start_box(depth, near[0][1]["box"], "person"):
-                            found, last_ok = True, now
-                    if not tgt.locked and want_nearest and still_since is not None and now - go_t > 0.3:
-                        want_nearest = False              # once per GO: whatever stands in front of me
-                        spot = nearest_blob(depth)
-                        if spot and tgt.start_at(depth, spot[0], spot[1], "thing in front"):
-                            found, last_ok = True, now
-                    if not tgt.locked and still_since is not None and now - still_since > 0.7:
-                        if ref is None or now - ref_t > 3.0:
-                            ref, ref_t = depth, now       # fresh "before" picture
-                        else:
-                            spot = motion_blob(depth, ref)
-                            if spot and tgt.start_at(depth, spot[0], spot[1], "visitor"):
-                                found, last_ok = True, now
-                    if found:
+                    how = None
+                    if tgt.gallery:
+                        # It has a target and lost it: only that same target will do.
+                        if tgt.reacquire(depth, hsv, now):
+                            how = "found the %s again (match %.2f)" % (tgt.label, tgt.sim)
+                    else:
+                        # Fresh GO, nothing chosen yet: a person in the middle if the finder sees
+                        # one, else the nearest thing in front, else whoever walks in.
+                        if people and seq != det_seq:
+                            det_seq = seq
+                            mid = [d for d in people if PROC_W * 0.15 < (d["box"][0] + d["box"][2]) / 2 < PROC_W * 0.85]
+                            near = [(box_depth(depth, d["box"]), d) for d in mid]
+                            near = sorted([n for n in near if n[0] is not None and n[0] < 4.5], key=lambda n: n[0])
+                            if near and tgt.start_box(depth, near[0][1]["box"], "person"):
+                                how = "picked the nearest person"
+                        if not tgt.locked and want_nearest and still_since is not None and now - go_t > 0.6:
+                            want_nearest = False
+                            spot = nearest_blob(depth)
+                            if spot and tgt.start_at(depth, spot[0], spot[1], "thing in front"):
+                                how = "picked the nearest thing in front"
+                        if not tgt.locked and still_since is not None and now - still_since > 0.7:
+                            if ref is None or now - ref_t > 3.0:
+                                ref, ref_t = depth, now       # fresh "before" picture
+                            else:
+                                spot = motion_blob(depth, ref)
+                                if spot and tgt.start_at(depth, spot[0], spot[1], "visitor"):
+                                    how = "picked whoever walked in"
+                    if how:
+                        found, last_ok = True, now
+                        tgt.observe(hsv)
                         self.drive.beep()
-                        print("[follow_bot] picked up a %s at %.2f m" % (tgt.label, tgt.dist), flush=True)
+                        print("[follow_bot] %s at %.2f m" % (how, tgt.dist), flush=True)
+                        self._dump_event("pickup", how)
 
                 if not following:
                     status = "idle"
                     rec.idle(now)
+                    if not want_nearest:
+                        tgt.forget()                  # STOP then GO = choose afresh
                     want_nearest, go_t = True, now
                 elif found:
                     cx, cy = tgt.center
@@ -762,16 +909,14 @@ class FollowBot(object):
                     rec.seen(now, ex, tgt.dist < 0.9, vz_s)
                     status = "follow"
                     note = "%s %.1fm" % (tgt.label, tgt.dist)
-                    if not was_visible:
-                        self._save_frame(frame, det, now)
                 elif tgt.locked:
                     status = "follow"                 # missed a frame or two; hold still
                 elif self.search and rec._have:
-                    # Lost what it was following: turn and look (the person finder picks people up again).
+                    # Lost what it was following: turn and look for that same target.
                     vx, vz, status, note = rec.cmd(now)
                 else:
                     status = "waiting"
-                if status == "lost":                  # gave up looking: stand still and watch for a visitor
+                if status == "lost":                  # gave up looking: stand still until it comes back
                     status, note = "waiting", ""
             else:
                 det, mask = detect(frame, ranges, prev)
@@ -862,6 +1007,37 @@ class FollowBot(object):
             if ok:
                 with self.lock:
                     self.jpeg = jpg.tobytes()
+
+    def _remember(self, now, frame, depth):
+        """Black box: keep the last ~2.5 s of colour + depth, 5 a second."""
+        if not self.frames_dir or depth is None or now - self._recent_t < 0.2:
+            return
+        self._recent_t = now
+        ok1, jpg = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 80])
+        ok2, png = cv.imencode(".png", depth[::2, ::2])
+        if ok1 and ok2:
+            self._recent.append((now, jpg.tobytes(), png.tobytes()))
+            del self._recent[:-12]
+
+    def _dump_event(self, kind, text, keep=30):
+        """Write the black box to disk when the target is picked up, lost or let go."""
+        if not self.frames_dir or not self._recent:
+            return
+        d = os.path.join(self.frames_dir, "event-%02d-%s" % (self._event_n % keep, kind))
+        self._event_n += 1
+        try:
+            os.makedirs(d, exist_ok=True)
+            t_end = self._recent[-1][0]
+            for t, jpg, png in self._recent:
+                stem = os.path.join(d, "%+.1fs" % (t - t_end))
+                open(stem + "-color.jpg", "wb").write(jpg)
+                open(stem + "-depth.png", "wb").write(png)
+            tg = self.target
+            open(os.path.join(d, "info.txt"), "w").write(
+                "%s: %s\nlabel=%s dist=%.2f box(full-res)=%s match=%.2f width_m=%.2f gallery=%d\n"
+                % (kind, text, tg.label, tg.dist, tg.rect if tg.box else None, tg.sim, tg.width_m, len(tg.gallery)))
+        except Exception:
+            pass
 
     def _save_frame(self, frame, det, now, keep=40):
         """Debug aid: keep pictures of the last `keep` things taken for the toy."""
@@ -986,7 +1162,7 @@ PAGE = """<!doctype html>
 <p><a href="/lidar" style="color:#9cc3ff">Lidar view</a></p>
 <script>
 const words = {idle:"Press GO, then tap what to follow or walk in front of me!", follow:"I see it! Following...",
-               waiting:"Tap what to follow, or walk in front of me!",
+               waiting:"I'm waiting. Stand in front of me, or tap what to follow.",
                search:"Where did it go? Looking...", backup:"Oops, too close! Backing up...", lost:"I can't find it. Show me the toy!",
                "no camera":"My camera is not working."};
 function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show); }

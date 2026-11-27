@@ -48,7 +48,11 @@ run)
     # -tt so Ctrl+C reaches the robot and follow_bot.py can stop the motors cleanly.
     ssh -tt "$PI" "cd $REMOTE_DIR && bash kill_rosmaster.sh >/dev/null 2>&1; rm -rf /tmp/follow_frames; python3 -u follow_bot.py --save-frames /tmp/follow_frames $*" 2>&1 | tee "$OUT/follow.log"
     # Bring back the pictures of whatever it took for the toy during this run.
-    mkdir -p "$OUT/frames" && scp -q "$PI:/tmp/follow_frames/*.jpg" "$OUT/frames/" 2>/dev/null && echo "Saved pictures to pi_reports/frames/"
+    # Bring back the debug pictures: what it locked onto, and the seconds before each loss.
+    R="$OUT/run-$(date +%H%M%S)"; mkdir -p "$R"
+    cp "$OUT/follow.log" "$R/" 2>/dev/null
+    ssh "$PI" 'tar czf - -C /tmp/follow_frames . 2>/dev/null' | tar xzf - -C "$R" 2>/dev/null
+    echo "Saved this run's log and pictures to ${R#$REPO/} ($(ls "$R" | wc -l | tr -d ' ') items)"
     ;;
 snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
