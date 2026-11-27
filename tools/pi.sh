@@ -41,8 +41,14 @@ echo "== serial devices"; ls -l /dev/serial/by-id/ /dev/myserial /dev/rplidar /d
 echo "== lsusb"; lsusb
 echo "== udev rules"; ls /etc/udev/rules.d/; grep -h -iE "lidar|serial|ttyUSB" /etc/udev/rules.d/* 2>/dev/null
 LIB=$(python3 -c "import Rosmaster_Lib; print(Rosmaster_Lib.__file__)" 2>&1)
-echo "== Rosmaster_Lib: $LIB"; grep -n "com=" "$LIB" | head -5
-echo "== Rosmaster_Lib lidar functions"; grep -n "def " "$LIB" | grep -iE "lidar|laser|scan" || echo "(none)"
+echo "== Rosmaster_Lib: $LIB"   # may live inside a zipped .egg, so ask Python instead of grep
+python3 -c "
+import inspect, Rosmaster_Lib
+R = Rosmaster_Lib.Rosmaster
+print('init:', inspect.signature(R.__init__))
+print('lidar-like methods:', [n for n in dir(R) if any(k in n.lower() for k in ('lidar', 'laser', 'scan'))] or '(none)')
+print('all methods:', [n for n in dir(R) if not n.startswith('_')])
+" 2>&1
 echo "== python"; python3 --version; python3 -c "import cv2; print('cv2', cv2.__version__, cv2.__file__)" 2>&1
 echo "== lidar-related files in home"; ls ~ ; find ~ -maxdepth 4 -iname "*lidar*" 2>/dev/null | head -20
 echo "== recent tty kernel messages"; dmesg 2>/dev/null | grep -iE "tty|cp210|ch34" | tail -15
