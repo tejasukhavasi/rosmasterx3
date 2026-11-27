@@ -204,6 +204,55 @@ def learn_color(frame, at=None):
     return ranges, "Got it!"
 
 
+def segment_color(frame, x, y):
+    """The patch of roughly uniform colour around a tapped point (for things the
+    depth camera cannot see, like a small ball). Returns a full-size bool mask or None."""
+    h, w = frame.shape[:2]
+    x, y = int(clamp(x, 0, w - 1)), int(clamp(y, 0, h - 1))
+    blur = cv.GaussianBlur(frame, (7, 7), 0)
+    # A finger is imprecise: start from the most colourful pixel close to the tap.
+    r = 14
+    x0, y0, x1, y1 = max(0, x - r), max(0, y - r), min(w, x + r + 1), min(h, y + r + 1)
+    sat = cv.cvtColor(blur[y0:y1, x0:x1], cv.COLOR_BGR2HSV)[:, :, 1]
+    sy, sx = np.unravel_index(int(np.argmax(sat)), sat.shape)
+    seed = (x0 + int(sx), y0 + int(sy))
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv.floodFill(blur, mask, seed, 0, (26, 26, 26), (26, 26, 26),
+                 4 | cv.FLOODFILL_MASK_ONLY | cv.FLOODFILL_FIXED_RANGE | (255 << 8))
+    m = mask[1:-1, 1:-1] > 0
+    n = int(m.sum())
+    if n < 40 or n > 0.06 * h * w:
+        return None                                   # a speck, or a big surface like the floor or a wall
+    bx, by, bw, bh = cv.boundingRect(m.astype(np.uint8))
+    if n < 0.35 * bw * bh:
+        return None                                   # straggly: leaked along an edge
+    return m
+
+
+def ranges_from_mask(frame, mask):
+    """HSV colour ranges that cover the pixels of a segmented object, or None if it is too grey."""
+    hsv = cv.cvtColor(cv.GaussianBlur(frame, (5, 5), 0), cv.COLOR_BGR2HSV)[mask].astype(np.float32)
+    vivid = hsv[(hsv[:, 1] > 60) & (hsv[:, 2] > 50)]
+    if len(vivid) < 0.5 * len(hsv) or len(vivid) < 30:
+        return None
+    hist = np.bincount(vivid[:, 0].astype(int), minlength=180).astype(np.float32)
+    hist = np.convolve(np.concatenate([hist[-4:], hist, hist[:4]]), np.ones(9), "valid")
+    h_mid = int(np.argmax(hist))
+    dh = np.abs(((vivid[:, 0] - h_mid + 90) % 180) - 90)
+    core = vivid[dh <= 8]
+    if np.median(core[:, 1]) < 100:
+        return None                                   # floor, skin, wood: too dull to tell apart by colour
+    tol = int(clamp(np.percentile(dh[dh <= 8], 90) + 4, 6, 10))
+    s_lo = int(max(60, 0.78 * np.median(core[:, 1])))
+    v_lo = int(max(60, 0.45 * np.median(core[:, 2])))
+    lo, hi = h_mid - tol, h_mid + tol
+    if lo < 0:
+        return [((0, s_lo, v_lo), (hi, 255, 255)), ((180 + lo, s_lo, v_lo), (179, 255, 255))]
+    if hi > 179:
+        return [((lo, s_lo, v_lo), (179, 255, 255)), ((0, s_lo, v_lo), (hi - 180, 255, 255))]
+    return [((lo, s_lo, v_lo), (hi, 255, 255))]
+
+
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
@@ -698,6 +747,9 @@ class FollowBot(object):
         self.mode = "shape" if hasattr(camera, "depth") else "colour"
         self.target = DepthTarget()
         self.target_dist = FOLLOW_DIST
+        self._msg_seen, self._msg_t = "", 0.0
+        self.auto_pick = False          # True (--finder): GO with nothing tapped picks the nearest person
+        self.has_color_target = False   # a colour was chosen (tap or button)
         self.detector = None            # set later if the object finder loads
         self.detector_note = "off"
         self._tap = None
@@ -712,7 +764,7 @@ class FollowBot(object):
     def set_color(self, name):
         with self.lock:
             self.color_name, self.ranges, self.message = name, COLORS[name], ""
-            self.mode = "colour"
+            self.mode, self.has_color_target = "colour", True
 
     def set_mode(self, mode):
         with self.lock:
@@ -755,6 +807,7 @@ class FollowBot(object):
         with self.lock:
             return {"following": self.following, "color": self.color_name if self.mode == "colour" else "",
                     "mode": self.mode, "target": self.target.label if self.target.locked else "",
+                    "chosen": bool(self.target.locked or self.target.gallery) if self.mode == "shape" else self.has_color_target,
                     "finder": self.detector_note,
                     "speed": self.speed_name, "status": self.status,
                     "message": self.message, "mask": self.show_mask, "battery": self.drive.battery()}
@@ -775,7 +828,8 @@ class FollowBot(object):
         still_since = None       # when the robot last came to rest
         ref, ref_t = None, 0.0   # depth picture to compare against for "something walked in"
         det_seq = -1
-        want_nearest, go_t = True, 0.0   # shape mode: on GO, pick up the nearest thing in front
+        want_nearest, go_t = True, 0.0   # shape mode without a person finder: on GO, take the nearest thing
+        seen_note_t = 0.0
         while self.running:
             ok, raw = self.cam.get_frame()
             if not ok:
@@ -806,25 +860,33 @@ class FollowBot(object):
                     self.message = msg
                     if ranges:
                         self.ranges, self.color_name, self.mode = ranges, "learned", "colour"
+                if self.message and self.message != self._msg_seen:
+                    self._msg_seen, self._msg_t = self.message, time.time()
+                elif self.message and time.time() - self._msg_t > 4.0:
+                    self.message = self._msg_seen = ""
                 tap, self._tap = self._tap, None
                 if tap is not None:
                     # Tap = "follow this". By shape if the depth camera can see it, else by its colour.
-                    if self.mode == "shape":
-                        if depth is not None and self.target.start_at(depth, tap[0], tap[1], "thing you tapped"):
-                            self.message = "OK! Following that (%.1f m away)." % self.target.dist
-                            last_ok = time.time()
-                            want_nearest = False
-                            print("[follow_bot] tap locked on at %.2f m" % self.target.dist, flush=True)
-                        else:
-                            self.message = "I can't lock onto that. It needs to be 0.6 to 4 m away. For a small toy, use a colour button."
-                            print("[follow_bot] tap at x=%d y=%d found nothing to lock onto" % tap, flush=True)
+                    # Tap = "this is what to follow". Segment the thing under the finger:
+                    # by distance if the depth camera sees it, otherwise by its patch of colour.
+                    if depth is not None and self.target.start_at(depth, tap[0], tap[1], "thing you tapped"):
+                        self.mode = "shape"
+                        self.message = "Got it (%.1f m away)." % self.target.dist + ("" if self.following else " Press GO!")
+                        last_ok = time.time()
+                        print("[follow_bot] tap at x=%d y=%d: locked on by shape at %.2f m, %.2f m wide"
+                              % (tap[0], tap[1], self.target.dist, self.target.width_m), flush=True)
+                        self._dump_event("tap", "shape")
                     else:
-                        ranges, msg = learn_color(frame, at=tap)
+                        seg = segment_color(frame, tap[0], tap[1])
+                        ranges = ranges_from_mask(frame, seg) if seg is not None else None
                         if ranges:
-                            self.ranges, self.color_name = ranges, "learned"
-                            self.message = "OK! Following that colour."
+                            self.target.forget()
+                            self.ranges, self.color_name, self.mode, self.has_color_target = ranges, "tapped", "colour", True
+                            self.message = "Got it, by its colour." + ("" if self.following else " Press GO!")
+                            print("[follow_bot] tap at x=%d y=%d: locked on by colour %s" % (tap[0], tap[1], ranges), flush=True)
                         else:
-                            self.message = "That spot is too dull to follow by colour."
+                            self.message = "I can't pick that out. Tap right on it; it should be 0.6 to 4 m away or brightly coloured."
+                            print("[follow_bot] tap at x=%d y=%d: nothing I can segment there" % tap, flush=True)
                 following, ranges, show_mask = self.following, self.ranges, self.show_mask
                 mode = self.mode
                 self.raw = frame
@@ -860,34 +922,34 @@ class FollowBot(object):
                     print("[follow_bot] lost the %s at %.2f m: %s" % (tgt.label, tgt.dist, tgt.why), flush=True)
                     self._dump_event("lost", tgt.why)
 
-                if following and not tgt.locked and depth is not None:
+                if not tgt.locked and depth is not None and (following or tgt.gallery):
                     how = None
                     if tgt.gallery:
                         # It has a target and lost it: only that same target will do.
                         if tgt.reacquire(depth, hsv, now):
                             how = "found the %s again (match %.2f)" % (tgt.label, tgt.sim)
-                    else:
-                        # Fresh GO, nothing chosen yet: a person in the middle if the finder sees
-                        # one, else the nearest thing in front, else whoever walks in.
-                        if people and seq != det_seq:
+                    elif not self.auto_pick:
+                        pass                              # nothing tapped yet: wait for a tap
+                    elif self.detector is not None:
+                        # Nothing chosen yet: people only. The nearest person the finder sees
+                        # in the middle of the view. Anything else has to be tapped.
+                        if seq != det_seq:
                             det_seq = seq
-                            mid = [d for d in people if PROC_W * 0.15 < (d["box"][0] + d["box"][2]) / 2 < PROC_W * 0.85]
+                            mid = [d for d in people if PROC_W * 0.12 < (d["box"][0] + d["box"][2]) / 2 < PROC_W * 0.88]
                             near = [(box_depth(depth, d["box"]), d) for d in mid]
                             near = sorted([n for n in near if n[0] is not None and n[0] < 4.5], key=lambda n: n[0])
                             if near and tgt.start_box(depth, near[0][1]["box"], "person"):
                                 how = "picked the nearest person"
-                        if not tgt.locked and want_nearest and still_since is not None and now - go_t > 0.6:
-                            want_nearest = False
-                            spot = nearest_blob(depth)
-                            if spot and tgt.start_at(depth, spot[0], spot[1], "thing in front"):
-                                how = "picked the nearest thing in front"
-                        if not tgt.locked and still_since is not None and now - still_since > 0.7:
-                            if ref is None or now - ref_t > 3.0:
-                                ref, ref_t = depth, now       # fresh "before" picture
-                            else:
-                                spot = motion_blob(depth, ref)
-                                if spot and tgt.start_at(depth, spot[0], spot[1], "visitor"):
-                                    how = "picked whoever walked in"
+                            elif now - seen_note_t > 3.0:
+                                seen_note_t = now
+                                print("[follow_bot] finder: %d people in view, %d in the middle, %d with a distance reading (%.1f looks/s)"
+                                      % (len(people), len(mid), len(near), self.detector.fps), flush=True)
+                    elif want_nearest and still_since is not None and now - go_t > 0.6:
+                        # No person finder available: fall back to the nearest thing in front, once per GO.
+                        want_nearest = False
+                        spot = nearest_blob(depth)
+                        if spot and tgt.start_at(depth, spot[0], spot[1], "thing in front"):
+                            how = "picked the nearest thing in front (no person finder)"
                     if how:
                         found, last_ok = True, now
                         tgt.observe(hsv)
@@ -896,11 +958,11 @@ class FollowBot(object):
                         self._dump_event("pickup", how)
 
                 if not following:
-                    status = "idle"
+                    status = "idle"                   # keeps watching the tapped thing, just doesn't drive
                     rec.idle(now)
-                    if not want_nearest:
-                        tgt.forget()                  # STOP then GO = choose afresh
                     want_nearest, go_t = True, now
+                    if found:
+                        note = "%s %.1fm" % (tgt.label, tgt.dist)
                 elif found:
                     cx, cy = tgt.center
                     x1, y1, x2, y2 = tgt.rect
@@ -926,11 +988,21 @@ class FollowBot(object):
                     prev = None
                 if show_mask:
                     frame[mask > 0] = (0, 255, 0)
+                elif det and self.has_color_target:
+                    r = int(det[2] / 2) + 4
+                    y0, y1, x0, x1 = max(0, int(det[1]) - r), int(det[1]) + r, max(0, int(det[0]) - r), int(det[0]) + r
+                    sel = mask[y0:y1, x0:x1] > 0
+                    roi = frame[y0:y1, x0:x1]
+                    roi[sel] = (roi[sel] * 0.72 + np.array((0, 255, 0)) * 0.28).astype(np.uint8)
                 streak = streak + 1 if det else 0
                 blip = det if (det and not was_visible and streak < CONFIRM_FRAMES) else None
                 if blip:
                     det = None                        # not convinced yet; carry on as if unseen
-                if not following:
+                if not self.has_color_target:
+                    det = blip = None
+                    status = "waiting" if following else "idle"
+                    rec.idle(now)
+                elif not following:
                     status = "idle"
                     rec.idle(now)                     # pressing GO with no toy in view starts a scan
                 elif det:
@@ -993,9 +1065,9 @@ class FollowBot(object):
             for d in people:
                 x1, y1, x2, y2 = [int(v) for v in d["box"]]
                 cv.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 1)
+                cv.putText(frame, "person", (x1 + 3, max(12, y1 + 14)), cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
             if mode == "shape" and self.target.locked:
-                x1, y1, x2, y2 = self.target.rect
-                cv.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                self._tint(frame, self.target)
                 self._draw(frame, None, (status + " " + note).strip(), True)
             else:
                 self._draw(frame, det or blip, (status + " " + note).strip(), following or mode == "shape")
@@ -1007,6 +1079,22 @@ class FollowBot(object):
             if ok:
                 with self.lock:
                     self.jpeg = jpg.tobytes()
+
+    @staticmethod
+    def _tint(frame, tgt):
+        """Show exactly which pixels are being followed: tinted green with an outline."""
+        if tgt._blob is None:
+            return
+        x, y, blob = tgt._blob
+        big = cv.resize(blob.astype(np.uint8), (blob.shape[1] * 2, blob.shape[0] * 2), interpolation=cv.INTER_NEAREST)
+        x, y = x * 2, y * 2
+        h, w = frame.shape[:2]
+        big = big[:max(0, h - y), :max(0, w - x)]
+        roi = frame[y:y + big.shape[0], x:x + big.shape[1]]
+        sel = big > 0
+        roi[sel] = (roi[sel] * 0.72 + np.array((0, 255, 0)) * 0.28).astype(np.uint8)
+        found = cv.findContours(big, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        cv.drawContours(roi, found[0] if len(found) == 2 else found[1], -1, (255, 255, 255), 2)
 
     def _remember(self, now, frame, depth):
         """Black box: keep the last ~2.5 s of colour + depth, 5 a second."""
@@ -1101,9 +1189,6 @@ class FollowBot(object):
             c = (int(det[0]), int(det[1]))
             cv.circle(frame, c, int(det[2] / 2) + 3, (255, 255, 255), 2)
             cv.drawMarker(frame, c, (255, 255, 255), cv.MARKER_CROSS, 12, 1)
-        if not following:
-            r = int(h * LEARN_BOX / 2)
-            cv.rectangle(frame, (w // 2 - r, h // 2 - r), (w // 2 + r, h // 2 + r), (255, 255, 255), 1)
         cv.putText(frame, status.upper(), (12, 30), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
         cv.putText(frame, status.upper(), (12, 30), cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -1116,74 +1201,59 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Follow Bot</title>
 <style>
-  body{font-family:system-ui,sans-serif;margin:0;padding:12px;background:#14213d;color:#fff;text-align:center}
-  h1{margin:4px 0 10px;font-size:1.5rem}
-  img{width:100%;max-width:480px;border-radius:14px;border:3px solid #fff3}
-  .row{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:10px auto;max-width:480px}
-  button{border:0;border-radius:14px;padding:14px 10px;font-size:1.05rem;font-weight:700;color:#fff;
-         background:#3a4a6b;flex:1 1 28%;min-width:88px}
+  body{font-family:system-ui,sans-serif;margin:0;padding:10px;background:#101623;color:#fff;text-align:center}
+  #wrap{position:relative;display:inline-block;max-width:720px;width:100%}
+  #cam{width:100%;border-radius:14px;border:3px solid #fff3;cursor:crosshair;display:block;touch-action:manipulation}
+  #dot{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;border:3px solid #fff;border-radius:50%;
+       pointer-events:none;opacity:0;transition:opacity .6s}
+  #status{font-size:1.25rem;font-weight:600;min-height:1.7em;margin:10px 0 4px}
+  #hint{opacity:.75;margin-bottom:8px}
+  .row{display:flex;gap:10px;justify-content:center;margin:10px auto;max-width:720px}
+  button{border:0;border-radius:14px;padding:14px 10px;font-size:1.05rem;font-weight:700;color:#fff;background:#33415f;flex:1}
   button.on{outline:4px solid #fff}
-  #go{background:#2a9d4a;font-size:1.5rem;flex-basis:45%}
-  #stop{background:#d62828;font-size:1.5rem;flex-basis:45%}
-  #status{font-size:1.15rem;min-height:1.6em;margin:8px 0}
-  small{opacity:.7}
+  #go{background:#2a9d4a;font-size:1.6rem}
+  #go:disabled{background:#3b4a3f;color:#fff8}
+  #stop{background:#d62828;font-size:1.6rem}
+  small, a{opacity:.75;color:#cfe0ff}
 </style></head><body>
-<h1>&#129302; Follow Bot</h1>
-<img id="cam" src="/video_feed" alt="robot camera">
-<small>Tap anything in the picture to follow it</small>
+<div id="wrap"><img id="cam" src="/video_feed" alt="robot camera"><div id="dot"></div></div>
 <div id="status">&nbsp;</div>
+<div id="hint">Tap the thing I should follow. I'll highlight what I picked.</div>
 <div class="row">
-  <button id="go" onclick="post('start')">GO!</button>
+  <button id="go" onclick="post('start')">GO</button>
   <button id="stop" onclick="post('stop')">STOP</button>
 </div>
 <div class="row">
-  <button id="shape" onclick="post('mode/shape')">&#128694; Follow people and things</button>
-</div>
-<div class="row" id="colors">
-  <button data-c="red" style="background:#d62828">Red</button>
-  <button data-c="orange" style="background:#e76f00">Orange</button>
-  <button data-c="yellow" style="background:#c79a00">Yellow</button>
-  <button data-c="green" style="background:#2a9d4a">Green</button>
-  <button data-c="blue" style="background:#1d6fd6">Blue</button>
-  <button data-c="pink" style="background:#d6409f">Pink</button>
-</div>
-<div class="row">
-  <button data-c="learned" onclick="post('learn')">Learn my toy's colour</button>
+  <button data-s="turtle">&#128034; Slow</button>
+  <button data-s="bunny">&#128007; Fast</button>
   <button onclick="post('distance')">Stay this far away</button>
 </div>
-<div class="row" id="speeds">
-  <button data-s="turtle">&#128034; Turtle</button>
-  <button data-s="bunny">&#128007; Bunny</button>
-</div>
-<div class="row">
-  <button id="mask" onclick="post('mask')">&#128064; Show what matches</button>
-</div>
-<small id="batt"></small>
-<p><a href="/lidar" style="color:#9cc3ff">Lidar view</a></p>
+<small id="batt"></small> &nbsp; <a href="/lidar">Lidar view</a>
 <script>
-const words = {idle:"Press GO, then tap what to follow or walk in front of me!", follow:"I see it! Following...",
-               waiting:"I'm waiting. Stand in front of me, or tap what to follow.",
-               search:"Where did it go? Looking...", backup:"Oops, too close! Backing up...", lost:"I can't find it. Show me the toy!",
-               "no camera":"My camera is not working."};
-function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show); }
+const words = {
+  idle0:"Tap what I should follow.", idle1:"Ready. Press GO!",
+  follow:"Following!", search:"Lost it. Looking around...", backup:"Too close! Backing up...",
+  waiting0:"Tap what I should follow.", waiting1:"I lost it. Bring it back into view, or tap again.",
+  lost:"I can't find it. Tap it again.", "no camera":"My camera is not working."};
+function post(p){ fetch('/api/'+p,{method:'POST'}).then(r=>r.json()).then(show).catch(()=>{}); }
+let msgUntil = 0;
 function show(s){
-  let t = s.message || words[s.status] || s.status;
-  if (!s.message && s.status=='follow' && s.target) t = "Following the "+s.target+"!";
+  let t = words[s.status] || words[s.status+(s.chosen?1:0)] || s.status;
+  if (s.message){ t = s.message; }
   document.getElementById('status').textContent = t;
-  document.getElementById('shape').classList.toggle('on', s.mode=='shape');
-  document.querySelectorAll('[data-c]').forEach(b=>b.classList.toggle('on', b.dataset.c==s.color));
   document.querySelectorAll('[data-s]').forEach(b=>b.classList.toggle('on', b.dataset.s==s.speed));
   document.getElementById('go').classList.toggle('on', s.following);
-  document.getElementById('mask').classList.toggle('on', s.mask);
-  document.getElementById('batt').textContent = (s.battery ? 'Battery '+s.battery+' V   ' : '') + 'Person finder: '+s.finder;
+  document.getElementById('go').disabled = !s.chosen && !s.following;
+  document.getElementById('batt').textContent = s.battery ? 'Battery '+s.battery+' V' : '';
 }
-document.getElementById('cam').addEventListener('click', e=>{
-  const r=e.target.getBoundingClientRect();
-  post('tap/'+((e.clientX-r.left)/r.width).toFixed(4)+'/'+((e.clientY-r.top)/r.height).toFixed(4));
+const cam=document.getElementById('cam'), dot=document.getElementById('dot');
+cam.addEventListener('click', e=>{
+  const r=cam.getBoundingClientRect(), fx=(e.clientX-r.left)/r.width, fy=(e.clientY-r.top)/r.height;
+  dot.style.left=(fx*100)+'%'; dot.style.top=(fy*100)+'%'; dot.style.opacity=1; setTimeout(()=>dot.style.opacity=0, 500);
+  post('tap/'+fx.toFixed(4)+'/'+fy.toFixed(4));
 });
-document.querySelectorAll('#colors [data-c]').forEach(b=>b.onclick=()=>post('color/'+b.dataset.c));
 document.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>post('speed/'+b.dataset.s));
-setInterval(()=>fetch('/api/status').then(r=>r.json()).then(show).catch(()=>{}), 700);
+setInterval(()=>fetch('/api/status').then(r=>r.json()).then(show).catch(()=>{}), 600);
 </script></body></html>
 """
 
@@ -1351,8 +1421,8 @@ def main():
                     help="lidar angle that points straight ahead of the robot (tools/pi.sh calibrate)")
     ap.add_argument("--no-lidar", action="store_true", help="ignore the lidar even if it is plugged in")
     ap.add_argument("--lidar-port", default="/dev/rplidar")
-    ap.add_argument("--no-finder", action="store_true",
-                    help="don't load the person finder (YOLO); people are then picked up by tapping or walking in")
+    ap.add_argument("--finder", action="store_true",
+                    help="load the person finder (YOLO): GO with nothing tapped then follows the nearest person")
     ap.add_argument("--save-frames", default=None, metavar="DIR",
                     help="save a picture to DIR each time something is taken for the toy (last 40 kept)")
     ap.add_argument("--debug", action="store_true")
@@ -1388,7 +1458,8 @@ def main():
             fb.detector_note = "not available"
             print("[follow_bot] person finder not available: %s" % (str(e).splitlines() or [repr(e)])[0], flush=True)
 
-    if not args.no_finder and fb.mode == "shape":
+    if args.finder and fb.mode == "shape":
+        fb.auto_pick = True
         threading.Thread(target=load_finder, daemon=True).start()
 
     if args.save_frames:

@@ -17,7 +17,7 @@ import time
 
 
 class YoloDetector(object):
-    def __init__(self, weights=None, imgsz=320, conf=0.35, threads=3):
+    def __init__(self, weights=None, imgsz=416, conf=0.30, threads=3):
         import torch
         from ultralytics import YOLO
         torch.set_num_threads(threads)
