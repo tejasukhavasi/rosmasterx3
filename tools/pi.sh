@@ -5,6 +5,7 @@
 #   tools/pi.sh run      deploy, then run the follow bot; its log is saved in pi_reports/follow.log
 #   tools/pi.sh snap     save a camera frame from the running follow bot to pi_reports/
 #   tools/pi.sh diag     collect hardware info from the robot into pi_reports/diag.txt
+#   tools/pi.sh lidar    identify the lidar on /dev/rplidar into pi_reports/lidar.txt
 #
 # Extra arguments after "run" go to follow_bot.py, e.g.  tools/pi.sh run --no-motors
 # Set PI=pi@<ip> if yahboom.local does not resolve.
@@ -38,6 +39,10 @@ snap)
     f="$OUT/snap-$(date +%H%M%S).jpg"
     curl -s -m 8 -o "$f" "http://${PI#*@}:6501/snapshot.jpg" && echo "Saved $f" || echo "Could not fetch a frame. Is follow_bot.py running?"
     ;;
+lidar)
+    scp -q "$REPO/tools/lidar_probe.py" "$PI:/tmp/" && ssh "$PI" "python3 -u /tmp/lidar_probe.py" 2>&1 | tee "$OUT/lidar.txt"
+    echo "Saved pi_reports/lidar.txt"
+    ;;
 diag)
     ssh "$PI" 'bash -s' > "$OUT/diag.txt" 2>&1 <<'REMOTE'
 echo "== serial devices"; ls -l /dev/serial/by-id/ /dev/myserial /dev/rplidar /dev/ydlidar /dev/ttyUSB* /dev/ttyACM* /dev/ttyAMA* 2>&1
@@ -60,6 +65,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
