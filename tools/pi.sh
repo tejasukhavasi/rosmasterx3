@@ -14,6 +14,7 @@
 #   tools/pi.sh repair   step 1 of the SD-card repair: report the damage, schedule a disk check, reboot
 #   tools/pi.sh repair2  step 2, after the reboot: fix the package database and the compiler
 #   tools/pi.sh health   check the robot's SD card for corrupted system files (several minutes)
+#   tools/pi.sh depth-snap   save a colour picture and a depth picture taken together (pi_reports/depth_snap/)
 #   tools/pi.sh depth-test   run just the depth test (seconds). Summary in pi_reports/depth_test.txt
 #   tools/pi.sh scan     4 seconds of lidar readings into pi_reports/scan.txt (stop the follow bot first)
 #
@@ -79,6 +80,12 @@ dpkg -s debsums >/dev/null 2>&1 || sudo apt-get install -y -qq debsums
 sudo debsums -s 2>&1 | head -200; echo "== done"' 2>&1 | tee "$OUT/health.txt"
     echo "Saved pi_reports/health.txt"
     ;;
+depth-snap)
+    scp -q "$REPO/tools/depth_snap.py" "$PI:/tmp/" || exit 1
+    ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
+    ssh "$PI" 'PYTHONPATH=$HOME/pyorbbecsdk/install/lib python3 -u /tmp/depth_snap.py 2>&1' | grep "^##\|Traceback\|Error" | cut -c1-200
+    mkdir -p "$OUT/depth_snap" && scp -q "$PI:/tmp/depth_snap/*" "$OUT/depth_snap/" && echo "Saved to pi_reports/depth_snap/"
+    ;;
 depth-test)
     scp -q "$REPO/tools/depth_test.py" "$PI:/tmp/" || exit 1
     ssh "$PI" 'pkill -INT -f "python3.*[f]ollow_bot" && sleep 2'
@@ -130,6 +137,6 @@ REMOTE
     echo "Saved pi_reports/diag.txt"
     ;;
 *)
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
